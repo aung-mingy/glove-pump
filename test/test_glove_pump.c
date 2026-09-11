@@ -1,6 +1,6 @@
-/* Command parser + never-both-high test, host-native (no ESP32 attached).
+/* Command parser + pump/valve rules, host-native (no ESP32 attached).
  *
- *   gcc -Wall -o /tmp/test_glove_pump test/test_glove_pump.c -Itest/stubs && /tmp/test_glove_pump
+ *   gcc -Wall -Wextra -o /tmp/test_glove_pump test/test_glove_pump.c -Itest/stubs && /tmp/test_glove_pump
  *
  * Links the real main/glove_pump.c against stubbed GPIO, so it exercises the
  * production parser, not a copy of it.
@@ -68,11 +68,13 @@ static void reply_grab(void)
 
 #define SEND(cmd) do { char b[sizeof(cmd)]; memcpy(b, cmd, sizeof(cmd)); handle(b); reply_grab(); } while (0)
 
-/* Both low is legal; both high is not. Checked after every command. */
-#define EXPECT(cmd, want) do {                                  \
-        SEND(cmd);                                              \
-        assert(!strcmp(out, want));                             \
-        assert(!(level[1] && level[2]));                        \
+/* The two hardware rules, checked after every command: the pumps are never both
+ * high, and the valve is never left on the other pump's path. */
+#define EXPECT(cmd, want) do {                                          \
+        SEND(cmd);                                                      \
+        assert(!strcmp(out, want));                                     \
+        assert(!(level[PIN_COMP] && level[PIN_SUCT]));                  \
+        assert(!(level[PIN_COMP] && !level[PIN_VALVE]));                \
     } while (0)
 
 int main(void)
@@ -85,53 +87,59 @@ int main(void)
     /* The firmware's own pin config: output-only mode would make every readback
      * 0 and fail the boot selftest on hardware. */
     assert(gpio_config(&gpio_pins_cfg) == ESP_OK);
-    drive(0);
-    assert(gpio_get_level(PIN_A) == 0 && gpio_get_level(PIN_B) == 0);
+    write_pins(false, false, false);
+    assert(gpio_get_level(PIN_VALVE) == 0 && gpio_get_level(PIN_COMP) == 0 &&
+           gpio_get_level(PIN_SUCT) == 0);
 
     reply_reset();
-    SEND("status");                         /* startup state: both low */
-    assert(!strcmp(out, "OK gpio1=0 gpio2=0"));
+    SEND("status");                         /* startup state: off */
+    assert(!strcmp(out, "OK off gpio0=0 gpio1=0 gpio2=0"));
 
-    /* toggle walks the three states: off -> GPIO1 -> GPIO2 -> off */
-    EXPECT("toggle\n", "OK gpio1=1 gpio2=0");
-    EXPECT("toggle\n", "OK gpio1=0 gpio2=1");
-    EXPECT("toggle\n", "OK gpio1=0 gpio2=0");
+    /* the three named states */
+    EXPECT("suction\n", "OK suction gpio0=0 gpio1=0 gpio2=1");
+    EXPECT("compression\n", "OK compression gpio0=1 gpio1=1 gpio2=0");
+    EXPECT("COMPRESSION\n", "OK compression gpio0=1 gpio1=1 gpio2=0");
+    EXPECT("off\n", "OK off gpio0=0 gpio1=0 gpio2=0");
 
-    /* raising one drops the other first — never both high */
-    EXPECT("set gpio 1 high\n", "OK gpio1=1 gpio2=0");
-    EXPECT("SET GPIO 2 HIGH\n", "OK gpio1=0 gpio2=1");
-    EXPECT("set gpio 2 high\n", "OK gpio1=0 gpio2=1");
+    /* toggle cycles off -> suction -> compression -> off */
+    EXPECT("toggle\n", "OK suction gpio0=0 gpio1=0 gpio2=1");
+    EXPECT("toggle\n", "OK compression gpio0=1 gpio1=1 gpio2=0");
+    EXPECT("toggle\n", "OK off gpio0=0 gpio1=0 gpio2=0");
 
-    /* lowering is local: the other pin keeps its level */
-    EXPECT("set gpio 1 low\n", "OK gpio1=0 gpio2=1");   /* GPIO2 still high */
-    EXPECT("set gpio 2 low\n", "OK gpio1=0 gpio2=0");   /* off */
-    EXPECT("set gpio 1 low\n", "OK gpio1=0 gpio2=0");   /* no-op, stays off */
-    EXPECT("set gpio 2 high\n", "OK gpio1=0 gpio2=1");
-    EXPECT("set gpio 1 high\n", "OK gpio1=1 gpio2=0");  /* drops GPIO2 */
-    EXPECT("set gpio 1 low\n", "OK gpio1=0 gpio2=0");   /* off again */
+    /* raw pin commands: raising a pump pairs the valve and drops the other pump */
+    EXPECT("set gpio 1 high\n", "OK compression gpio0=1 gpio1=1 gpio2=0");
+    EXPECT("set gpio 2 high\n", "OK suction gpio0=0 gpio1=0 gpio2=1");
+    EXPECT("set gpio 2 low\n", "OK off gpio0=0 gpio1=0 gpio2=0");
 
-    EXPECT("set gpio 3 high\n", "ERR pin must be 1 or 2");
+    /* lowering is local: the valve keeps its position, so a valve-only
+     * combination reads back as "raw" */
+    EXPECT("set gpio 1 high\n", "OK compression gpio0=1 gpio1=1 gpio2=0");
+    EXPECT("set gpio 1 low\n", "OK raw gpio0=1 gpio1=0 gpio2=0");
+    EXPECT("set gpio 0 low\n", "OK off gpio0=0 gpio1=0 gpio2=0");
+    EXPECT("set gpio 0 high\n", "OK raw gpio0=1 gpio1=0 gpio2=0");
+
+    /* toggle out of a raw combination goes to off */
+    EXPECT("toggle\n", "OK off gpio0=0 gpio1=0 gpio2=0");
+
+    EXPECT("set gpio 3 high\n", "ERR pin must be 0, 1 or 2");
     EXPECT("set gpio 1 sideways\n", "ERR level must be high or low");
-    EXPECT("set gpio 3 low\n", "ERR pin must be 1 or 2");
+    EXPECT("set gpio 1\n", "ERR unknown command");
     EXPECT("frobnicate\n", "ERR unknown command");
 
     reply_reset();
     SEND("\r\n");                            /* half of a CRLF: silence, no state change */
     assert(!strcmp(out, ""));
-    assert(level[1] == 0 && level[2] == 0);
+    assert(level[PIN_VALVE] == 0 && level[PIN_COMP] == 0 && level[PIN_SUCT] == 0);
 
-    /* both low is fine, only ever one high, and only ever 0 or 1 */
-    assert((level[1] == 0 || level[1] == 1) && (level[2] == 0 || level[2] == 1));
-
-    /* the boot selftest's expected walk must match what the commands produce */
-    for (int i = 0; i < 3; i++) {
-        drive(i);
-        assert(!(gpio_get_level(PIN_A) && gpio_get_level(PIN_B)));
-        assert(state() == i);
+    /* every state in the table is reachable and reads back as itself */
+    for (int i = 0; i < N_STATES; i++) {
+        write_pins(STATES[i].valve, STATES[i].comp, STATES[i].suct);
+        assert(current_state() == i);
+        assert(!(level[PIN_COMP] && level[PIN_SUCT]));
     }
 
     fflush(stdout);
     dup2(terminal, STDOUT_FILENO);
-    printf("PASS glove-pump parser + never-both-high\n");
+    printf("PASS glove-pump states + pump/valve rules\n");
     return 0;
 }

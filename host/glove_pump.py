@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Control the glove-pump ESP32-C3 over its USB CDC-ACM port. Stdlib only.
 
+    ./glove_pump.py suction
+    ./glove_pump.py compression
+    ./glove_pump.py off
     ./glove_pump.py toggle
-    ./glove_pump.py set 1 high
-    ./glove_pump.py set gpio 2 low      # same thing, either spelling
+    ./glove_pump.py set 1 high           # raw pin access
+    ./glove_pump.py set gpio 2 low       # same thing, either spelling
     ./glove_pump.py status
-    ./glove_pump.py                     # interactive: type commands, ^D to exit
-    ./glove_pump.py --selftest          # no hardware needed
+    ./glove_pump.py                      # interactive: type commands, ^D to exit
+    ./glove_pump.py --selftest           # no hardware needed
 
 Port is auto-picked from /dev/ttyACM* then /dev/ttyUSB*; override with --port.
 Baud rate is irrelevant: CDC-ACM ignores it.
@@ -77,13 +80,14 @@ def build_command(tokens):
     t = [x.lower() for x in tokens]
     if len(t) > 1 and t[1] == "gpio":
         t.pop(1)
-    if t in (["toggle"], ["status"]):
+    if t in (["toggle"], ["status"], ["off"], ["suction"], ["compression"]):
         return t[0]
-    if len(t) == 3 and t[0] == "set" and t[1] in ("1", "2", "gpio1", "gpio2") \
+    if len(t) == 3 and t[0] == "set" \
+            and t[1] in ("0", "1", "2", "gpio0", "gpio1", "gpio2") \
             and t[2] in ("high", "low"):
         return "set gpio %s %s" % (t[1][-1], t[2])
-    raise ValueError("bad command: %s (want: toggle | set 1|2 high|low | status)"
-                     % " ".join(tokens))
+    raise ValueError("bad command: %s (want: off | suction | compression | toggle | "
+                     "set 0|1|2 high|low | status)" % " ".join(tokens))
 
 
 def command(fd, cmd, timeout=1.0):
@@ -108,10 +112,15 @@ def run(fd, cmd, timeout=1.0):
 def run_selftest():
     assert build_command(["toggle"]) == "toggle"
     assert build_command(["status"]) == "status"
+    assert build_command(["off"]) == "off"
+    assert build_command(["Suction"]) == "suction"
+    assert build_command(["COMPRESSION"]) == "compression"
     assert build_command(["set", "1", "HIGH"]) == "set gpio 1 high"
+    assert build_command(["set", "0", "low"]) == "set gpio 0 low"
     assert build_command(["set", "gpio", "2", "low"]) == "set gpio 2 low"
-    assert build_command(["set", "gpio2", "low"]) == "set gpio 2 low"
-    for bad in ([], ["reboot"], ["set", "3", "high"], ["set", "1", "sideways"]):
+    assert build_command(["set", "gpio0", "low"]) == "set gpio 0 low"
+    for bad in ([], ["reboot"], ["set", "3", "high"], ["set", "1", "sideways"],
+                ["set", "1"], ["off", "now"]):
         try:
             build_command(bad)
             raise AssertionError("accepted bad command %r" % (bad,))
@@ -169,7 +178,8 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     # nargs="*", not REMAINDER: REMAINDER would swallow "--port X" typed after
     # the command words, turning it into part of the command.
-    ap.add_argument("cmd", nargs="*", help="toggle | set 1|2 high|low | status")
+    ap.add_argument("cmd", nargs="*", help="off | suction | compression | toggle | "
+                                           "set 0|1|2 high|low | status")
     ap.add_argument("--port", help="serial port (default: first /dev/ttyACM*, /dev/ttyUSB*)")
     ap.add_argument("--timeout", type=float, default=1.0, help="reply timeout, seconds")
     ap.add_argument("--selftest", action="store_true", help="run checks, no hardware")

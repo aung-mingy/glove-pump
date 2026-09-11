@@ -1,16 +1,29 @@
 /*
- * glove-pump — ESP32-C3 dual-GPIO controller over the native USB serial port.
+ * glove-pump — ESP32-C3 pump/valve controller over the native USB serial port.
  *
- * GPIO1 / GPIO2 may both be low, but never both high. Startup is both low.
- * The host sends line commands; every command answers with the resulting state.
+ * Outputs (high = device enabled):
+ *   GPIO0  valve              low  = suction pump -> output
+ *                             high = compression pump -> output
+ *   GPIO1  compression pump
+ *   GPIO2  suction pump
  *
- *   toggle                 next state: both low -> GPIO1 high -> GPIO2 high -> both low
- *   set gpio 1 high        GPIO1 high (GPIO2 is lowered first if it was high)
- *   set gpio 2 high        same for GPIO2
- *   set gpio 1 low         GPIO1 low, GPIO2 untouched (both-low = off)
- *   status                 report state without changing anything
+ * Three states. The valve always follows the running pump, so these are the
+ * only pump-running combinations that exist:
  *
- * Reply: "OK gpio1=<0|1> gpio2=<0|1>" or "ERR <reason>".
+ *   off          valve 0  comp 0  suct 0
+ *   suction      valve 0  comp 0  suct 1
+ *   compression  valve 1  comp 1  suct 0
+ *
+ * Commands (case-insensitive):
+ *   off | suction | compression   go to that state
+ *   toggle                        off -> suction -> compression -> off
+ *   set gpio 0|1|2 high|low       raw pin access; the two pumps can never be
+ *                                 high together, and raising a pump sets the
+ *                                 valve to match it
+ *   status                        report state and pin levels, change nothing
+ *
+ * Reply: "OK <state> gpio0=<0|1> gpio1=<0|1> gpio2=<0|1>" or "ERR <reason>",
+ * where <state> is off | suction | compression | raw.
  */
 
 #include <stdarg.h>
@@ -28,10 +41,23 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#define PIN_A GPIO_NUM_1
-#define PIN_B GPIO_NUM_2
+#define PIN_VALVE GPIO_NUM_0
+#define PIN_COMP  GPIO_NUM_1
+#define PIN_SUCT  GPIO_NUM_2
 
 static const char *TAG = "glove-pump";
+
+typedef struct {
+    const char *name;
+    bool valve, comp, suct;
+} pump_state_t;
+
+static const pump_state_t STATES[] = {
+    { "off",         false, false, false },
+    { "suction",     false, false, true  },
+    { "compression", true,  true,  false },
+};
+#define N_STATES ((int)(sizeof(STATES) / sizeof(STATES[0])))
 
 static void reply(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
@@ -45,63 +71,103 @@ static void reply(const char *fmt, ...)
     fflush(stdout);
 }
 
+/* Break-before-make: everything low, then the valve, then the pumps — the valve
+ * is never switched while a pump is running, and the two pumps are never both
+ * high, not even for microseconds. */
+static void write_pins(bool valve, bool comp, bool suct)
+{
+    gpio_set_level(PIN_VALVE, 0);
+    gpio_set_level(PIN_COMP, 0);
+    gpio_set_level(PIN_SUCT, 0);
+    gpio_set_level(PIN_VALVE, valve);
+    gpio_set_level(PIN_COMP, comp);
+    gpio_set_level(PIN_SUCT, suct);
+}
+
+/* Index into STATES matching the pads, or -1 for a combination the named states
+ * don't cover (reachable only by raw "set gpio 0 ..."). */
+static int current_state(void)
+{
+    bool valve = gpio_get_level(PIN_VALVE);
+    bool comp = gpio_get_level(PIN_COMP);
+    bool suct = gpio_get_level(PIN_SUCT);
+    for (int i = 0; i < N_STATES; i++) {
+        if (STATES[i].valve == valve && STATES[i].comp == comp && STATES[i].suct == suct) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 static void status(void)
 {
-    reply("OK gpio1=%d gpio2=%d", gpio_get_level(PIN_A), gpio_get_level(PIN_B));
+    int i = current_state();
+    reply("OK %s gpio0=%d gpio1=%d gpio2=%d", i < 0 ? "raw" : STATES[i].name,
+          gpio_get_level(PIN_VALVE), gpio_get_level(PIN_COMP), gpio_get_level(PIN_SUCT));
 }
 
-/* Current state, read from the pads: 0 = both low (off), 1 = GPIO1 high,
- * 2 = GPIO2 high. Both-high is not a state. */
-static int state(void)
+static void go_to_state(int i)
 {
-    if (gpio_get_level(PIN_A)) {
-        return 1;
-    }
-    return gpio_get_level(PIN_B) ? 2 : 0;
+    write_pins(STATES[i].valve, STATES[i].comp, STATES[i].suct);
+    status();
 }
 
-/* Drive to a state. Break-before-make: both drop first, so the pair is never
- * both high — not even for a few microseconds. */
-static void drive(int side)
+/* Raw pin access, for bench testing. Raising a pump enforces both hardware
+ * rules; lowering one is local (the valve keeps its position). */
+static void set_pin(int pin, bool high)
 {
-    gpio_set_level(PIN_A, 0);
-    gpio_set_level(PIN_B, 0);
-    if (side == 1) {
-        gpio_set_level(PIN_A, 1);
-    } else if (side == 2) {
-        gpio_set_level(PIN_B, 1);
+    if (high && (pin == PIN_COMP || pin == PIN_SUCT)) {
+        gpio_set_level(pin == PIN_COMP ? PIN_SUCT : PIN_COMP, 0);
+        gpio_set_level(PIN_VALVE, pin == PIN_COMP);   /* valve follows the pump */
     }
+    gpio_set_level(pin, high);
 }
 
-/* One runnable check on the invariant that matters, on real hardware. Walks
- * every state and checks the pads actually land there. Runs in microseconds at
- * boot; delete the call in app_main() if the load must not see a power-on blip. */
+/* One runnable check on the rules that matter, on real hardware. Walks the
+ * named states, then the raw pump path, and checks the pads really land there.
+ * Runs in microseconds at boot; delete the call in app_main() if the load must
+ * not see a power-on blip. */
 static void selftest(void)
 {
-    static const struct { int side, a, b; } walk[] = {
-        { 0, 0, 0 }, { 1, 1, 0 }, { 2, 0, 1 }, { 0, 0, 0 }, { 2, 0, 1 }, { 1, 1, 0 },
-    };
-    for (size_t i = 0; i < sizeof(walk) / sizeof(walk[0]); i++) {
-        drive(walk[i].side);
-        int a = gpio_get_level(PIN_A), b = gpio_get_level(PIN_B);
-        if (a != walk[i].a || b != walk[i].b) {
-            ESP_LOGE(TAG, "SELFTEST FAIL side=%d got gpio1=%d gpio2=%d want %d/%d",
-                     walk[i].side, a, b, walk[i].a, walk[i].b);
+    for (int i = 0; i < N_STATES; i++) {
+        write_pins(STATES[i].valve, STATES[i].comp, STATES[i].suct);
+        bool valve = gpio_get_level(PIN_VALVE);
+        bool comp = gpio_get_level(PIN_COMP);
+        bool suct = gpio_get_level(PIN_SUCT);
+        if (valve != STATES[i].valve || comp != STATES[i].comp || suct != STATES[i].suct) {
+            ESP_LOGE(TAG, "SELFTEST FAIL %s: got valve=%d comp=%d suct=%d, want %d/%d/%d",
+                     STATES[i].name, valve, comp, suct,
+                     STATES[i].valve, STATES[i].comp, STATES[i].suct);
+            return;
+        }
+        if (comp && suct) {
+            ESP_LOGE(TAG, "SELFTEST FAIL %s: both pumps high", STATES[i].name);
             return;
         }
     }
-    ESP_LOGI(TAG, "selftest PASS gpio1/gpio2 land on every state, never both high");
+    for (int pin = PIN_COMP; pin <= PIN_SUCT; pin++) {
+        set_pin(pin, true);
+        if (gpio_get_level(PIN_COMP) && gpio_get_level(PIN_SUCT)) {
+            ESP_LOGE(TAG, "SELFTEST FAIL raw gpio%d: both pumps high", pin);
+            return;
+        }
+    }
+    ESP_LOGI(TAG, "selftest PASS — off/suction/compression land on their pins");
 }
 
+/* GPIO number, or -1 if the token isn't one. */
 static int parse_pin(const char *s)
 {
+    if (!strcmp(s, "0") || !strcmp(s, "gpio0") || !strcmp(s, "gpio_0")) {
+        return PIN_VALVE;
+    }
     if (!strcmp(s, "1") || !strcmp(s, "gpio1") || !strcmp(s, "gpio_1")) {
-        return 1;
+        return PIN_COMP;
     }
     if (!strcmp(s, "2") || !strcmp(s, "gpio2") || !strcmp(s, "gpio_2")) {
-        return 2;
+        return PIN_SUCT;
     }
-    return 0;
+    return -1;
 }
 
 static void handle(char *line)
@@ -119,9 +185,16 @@ static void handle(char *line)
         return;                     /* blank line — e.g. half of a CRLF */
     }
 
+    for (int i = 0; i < N_STATES; i++) {
+        if (!strcmp(tok[0], STATES[i].name)) {
+            go_to_state(i);
+            return;
+        }
+    }
+
     if (!strcmp(tok[0], "toggle")) {
-        drive((state() + 1) % 3);       /* off -> GPIO1 -> GPIO2 -> off */
-        status();
+        int i = current_state();
+        go_to_state(i < 0 ? 0 : (i + 1) % N_STATES);   /* raw -> off */
         return;
     }
     if (!strcmp(tok[0], "status")) {
@@ -130,8 +203,8 @@ static void handle(char *line)
     }
     if (!strcmp(tok[0], "set") && n == 4 && !strcmp(tok[1], "gpio")) {
         int pin = parse_pin(tok[2]);
-        if (pin == 0) {
-            reply("ERR pin must be 1 or 2");
+        if (pin < 0) {
+            reply("ERR pin must be 0, 1 or 2");
             return;
         }
         bool high;
@@ -143,13 +216,7 @@ static void handle(char *line)
             reply("ERR level must be high or low");
             return;
         }
-        if (high) {
-            drive(pin);                 /* raising one drops the other first */
-        } else {
-            /* Lowering is local: the other pin keeps its level, so both-low
-             * (off) is reachable and a lowered pin is a no-op otherwise. */
-            gpio_set_level(pin == 1 ? PIN_A : PIN_B, 0);
-        }
+        set_pin(pin, high);
         status();
         return;
     }
@@ -183,7 +250,7 @@ static void console_init(void)
  * gpio_get_level() reads back 0 for ever. The boot selftest and status() report
  * the real pad level, so both directions must be enabled. */
 static const gpio_config_t gpio_pins_cfg = {
-    .pin_bit_mask = (1ULL << PIN_A) | (1ULL << PIN_B),
+    .pin_bit_mask = (1ULL << PIN_VALVE) | (1ULL << PIN_COMP) | (1ULL << PIN_SUCT),
     .mode = GPIO_MODE_INPUT_OUTPUT,
     .pull_up_en = GPIO_PULLUP_DISABLE,
     .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -196,10 +263,11 @@ void app_main(void)
 
     console_init();
 
-    drive(0);                   /* power-on state: both pins low (off) */
+    write_pins(false, false, false);    /* power-on state: off */
     selftest();
-    drive(0);
-    ESP_LOGI(TAG, "ready — commands: toggle | set gpio 1|2 high|low | status");
+    write_pins(false, false, false);
+    ESP_LOGI(TAG, "ready — commands: off | suction | compression | toggle | "
+                  "set gpio 0|1|2 high|low | status");
     status();
 
     char line[80];

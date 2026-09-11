@@ -10,6 +10,7 @@ typedef int gpio_num_t;
 typedef int esp_err_t;
 
 #define ESP_OK 0
+#define GPIO_NUM_0 0
 #define GPIO_NUM_1 1
 #define GPIO_NUM_2 2
 #define GPIO_MODE_DEF_INPUT 1

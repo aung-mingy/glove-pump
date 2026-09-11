@@ -1,40 +1,56 @@
 # glove-pump
 
-ESP32-C3 firmware that takes commands over its **native USB serial port** and drives
-**GPIO1 / GPIO2, which may both be low but never both high**. Startup is both low.
+ESP32-C3 firmware that takes commands over its **native USB serial port** and drives a
+pump/valve rig. Two host clients are included: a CLI and a Flask web UI.
 
 ```
-host  ──USB CDC-ACM──▶  ESP32-C3  ──▶  GPIO1 ┐
- (glove_pump.py)                ──▶  GPIO2 ┘  never both high
+host  ──USB CDC-ACM──▶  ESP32-C3  ──▶  GPIO0  valve
+ glove_pump.py                  ──▶  GPIO1  compression pump
+ glove_pump_ui.py               ──▶  GPIO2  suction pump
 ```
 
-Three states: both low (off), GPIO1 high, GPIO2 high.
+## Three states
+
+The valve always follows the running pump, so only these pump-running combinations exist:
+
+| State | GPIO0 valve | GPIO1 compression | GPIO2 suction | What it does |
+|---|---|---|---|---|
+| `off` | 0 | 0 | 0 | everything off |
+| `suction` | 0 | 0 | 1 | valve sends the suction pump to the output, suction pump on |
+| `compression` | 1 | 0→1 | 0 | valve sends the compression pump to the output, compression pump on |
+
+Startup is `off`. **The two pumps are never both high**, not even for microseconds, and the
+valve is never switched while a pump is running (everything drops, then the valve moves,
+then the pump starts).
 
 ## Commands
 
-Every line sent to the port gets exactly one line back: `OK gpio1=<0|1> gpio2=<0|1>`
-or `ERR <reason>`. Commands are case-insensitive.
+Every line sent to the port gets exactly one line back:
+`OK <state> gpio0=<0|1> gpio1=<0|1> gpio2=<0|1>` or `ERR <reason>`, where `<state>` is
+`off`, `suction`, `compression`, or `raw` for a hand-set pin combination. Case-insensitive.
 
 | Command | Effect |
 |---|---|
-| `toggle` | next state: both low → GPIO1 high → GPIO2 high → both low |
-| `set gpio 1 high` | GPIO1 high — GPIO2 is lowered first if it was high |
-| `set gpio 2 high` | GPIO2 high — GPIO1 is lowered first if it was high |
-| `set gpio 1 low` | GPIO1 low, **GPIO2 untouched** |
-| `set gpio 2 low` | GPIO2 low, **GPIO1 untouched** |
-| `status` | report state, change nothing |
+| `off` | all pins low |
+| `suction` | GPIO2 high, valve low |
+| `compression` | GPIO0 and GPIO1 high |
+| `toggle` | next state: off → suction → compression → off |
+| `set gpio 0 high\|low` | raw valve control |
+| `set gpio 1 high\|low` | raw compression pump; raising it drops GPIO2 and moves the valve high |
+| `set gpio 2 high\|low` | raw suction pump; raising it drops GPIO1 and moves the valve low |
+| `status` | report state and pin levels, change nothing |
 
-Raising a pin enforces the one rule: if the other pin is high it drops first
-(break-before-make, so the pair is never both high — not even for microseconds). Lowering
-a pin is local, so `set gpio 1 low` twice is a no-op and `set gpio 1 low` while GPIO2 is
-high leaves GPIO2 high. Both low (off) is reached by lowering whichever pin is high.
+The named states are the intended interface (the UI uses only those). `set gpio …` is raw
+bench access: raising a pump still enforces both hardware rules, lowering one leaves the
+valve where it is — which is how you reach a `raw` valve-only combination.
 
 ## Wiring
 
 | Signal | Pin | Notes |
 |---|---|---|
-| Output A | GPIO1 | plain IO (analog alt: XTAL_32K_N / ADC1_CH1) |
-| Output B | GPIO2 | plain IO (analog alt: ADC1_CH2) |
+| Valve | GPIO0 | plain IO (analog alt: XTAL_32K_P / ADC1_CH0) |
+| Compression pump | GPIO1 | plain IO (analog alt: XTAL_32K_N / ADC1_CH1) |
+| Suction pump | GPIO2 | plain IO (analog alt: ADC1_CH2) |
 | USB D− / D+ | GPIO18 / GPIO19 | fixed; the console and flashing ride on these |
 
 Plug the host into the USB port wired to **GPIO18/19**. On an ESP32-C3-DevKitM-1/DevKitC-1
@@ -42,10 +58,13 @@ that is the connector silked **USB**; the other one (**UART**) goes through a US
 chip and does not carry this console. Host side it shows up as `/dev/ttyACM0` (CDC-ACM —
 baud rate is ignored, any value works).
 
-GPIO2 is a boot strapping pin, but per the [ESP32-C3 datasheet](https://www.espressif.com/sites/default/files/documentation/esp32-c3_datasheet_en.pdf)
-(§3, Table 3-3) it **does not determine the boot mode** — Espressif only recommends pulling
-it up to avoid reset-time glitches. It is free to use as an output once the chip is up.
-If you add an external pull-down on GPIO2, don't make it strong.
+Two chip notes:
+- GPIO2 is a boot strapping pin, but per the [ESP32-C3 datasheet](https://www.espressif.com/sites/default/files/documentation/esp32-c3_datasheet_en.pdf)
+  (§3, Table 3-3) it **does not determine the boot mode** — Espressif only recommends pulling
+  it up to avoid reset-time glitches. Free to use as an output once the chip is up; don't add
+  a strong external pull-down.
+- GPIO0/GPIO1 are `XTAL_32K_P`/`XTAL_32K_N` (§2, Table 2-6). If your board fits an external
+  32.768 kHz crystal on those pins, don't drive them. The Espressif devkits don't.
 
 ## Build and flash
 
@@ -61,23 +80,42 @@ Console config lives in `sdkconfig.defaults`: `CONFIG_ESP_CONSOLE_USB_SERIAL_JTA
 (GPIO18/19, no bridge chip). To use the bridged UART port instead, swap that for
 `CONFIG_ESP_CONSOLE_UART_DEFAULT=y` — the firmware code is unchanged.
 
-## Host script
+## Host CLI
 
-`host/glove_pump.py`, stdlib only, no dependencies — **[full usage docs in host/README.md](host/README.md)**.
-Short version:
+`host/glove_pump.py` — stdlib only, no dependencies.
+**[Full usage docs in host/README.md](host/README.md).** Short version:
 
 ```bash
-./host/glove_pump.py toggle
-./host/glove_pump.py set 1 high        # or: set gpio 1 high
+./host/glove_pump.py suction
+./host/glove_pump.py compression
+./host/glove_pump.py off
+./host/glove_pump.py set 1 high        # raw pin access; "set gpio 1 high" also works
 ./host/glove_pump.py status
 ./host/glove_pump.py                   # interactive; ^D to exit
-./host/glove_pump.py --port /dev/ttyACM1 toggle
 ./host/glove_pump.py --selftest        # no hardware needed
 ```
 
 Port auto-detects from `/dev/ttyACM*` then `/dev/ttyUSB*`. It opens raw (no echo, no
 CR/LF translation), drains stale/boot-log lines, then sends one command. Exit status is
 0 for `OK`, 2 for a command it rejected locally, 1 for `ERR`/no reply/port problems.
+
+## Host web UI (Flask)
+
+`host/glove_pump_ui.py` — three buttons, one per state, plus the live pin levels. It asks the
+device for its state on every page load, so it shows the real pins rather than the last
+click, and reloads itself every 3 s.
+
+```bash
+python3 -m venv ~/.venvs/glove-ui
+~/.venvs/glove-ui/bin/pip install -r host/requirements.txt
+~/.venvs/glove-ui/bin/python host/glove_pump_ui.py            # http://127.0.0.1:8080
+~/.venvs/glove-ui/bin/python host/glove_pump_ui.py --bind 0.0.0.0   # reachable on the LAN
+~/.venvs/glove-ui/bin/python host/glove_pump_ui.py --port /dev/ttyACM1 --http-port 9000
+```
+
+Flask is the only dependency in the repo (`host/requirements.txt`). Nothing else — CLI,
+firmware, tests — needs anything beyond the stdlib. `--bind 0.0.0.0` exposes the rig to
+anyone on the network with no authentication; it's meant for a bench LAN.
 
 ## Tests
 
@@ -86,26 +124,31 @@ gcc -Wall -Wextra -o /tmp/test_glove_pump test/test_glove_pump.c -Itest/stubs &&
 python3 host/glove_pump.py --selftest
 ```
 
-The C test links the real `main/glove_pump.c` against stubbed GPIO and asserts
-**never both high** after **every** command path: all three `toggle` steps, raising each
-pin (which must drop the other), lowering each pin (which must leave the other alone),
-uppercase, bad pin, bad level, unknown command, blank line. Checked against two deliberate
-mutations — a `drive()` that forgets to clear the other pin, and a `set … low` that raises
-instead of lowering — both fail the test. Its fake GPIO also mirrors `gpio_config()`, so it
-fails if the pins are configured output-only (which makes every readback 0 — that bug
-shipped once and was caught by the boot selftest on hardware). The Python selftest checks
-command building and the line framing over a real pty (including that raw mode isn't
-mangling LF into CRLF).
+The C test links the real `main/glove_pump.c` against stubbed GPIO and checks the two
+hardware rules after **every** command path (all three named states, all three `toggle`
+steps, raising each pump, lowering each pump, uppercase, bad pin, bad level, unknown
+command, blank line): the pumps are never both high, and the valve is never left on the
+other pump's path. Verified against four deliberate mutations — a `set_pin()` that raises a
+pump without dropping the other, a `set_pin()` that forgets the valve, a `write_pins()` that
+never raises the valve, and a state table with the wrong valve value — each one aborts the
+test. Its fake GPIO also mirrors `gpio_config()`, so it fails if the pins are configured
+output-only (every readback reads 0 — that bug shipped once and was caught by the boot
+selftest on hardware).
 
-The firmware additionally runs a self-check on the real pins at every boot: it walks all
-three states and verifies the pads actually land there, logging
-`selftest PASS gpio1/gpio2 land on every state, never both high`. It blips the lines for
+The Python selftest checks command building and the line framing over a real pty (including
+that raw mode isn't mangling LF into CRLF). The Flask UI was exercised end to end over HTTP
+against a fake device on a pty: all three buttons, the state round trip, bad-state rejection,
+and the page reflecting the device on reload.
+
+The firmware additionally self-checks the real pins at boot: it walks the named states and
+the raw pump path, verifying the pads land where the table says, then logs
+`selftest PASS — off/suction/compression land on their pins`. It blips the lines for
 microseconds — delete the `selftest()` call in `app_main()` if your load must not see any
 blip at power-on.
 
 ## Notes
 
-- Power-on state is both pins low.
+- Power-on state is `off` (all pins low).
 - Lines may end in `\n` (scripts) or `\r` (terminals). The RX line-ending mode is set to
   `ESP_LINE_ENDINGS_CR` because the IDF default (CRLF) stalls the console read on a bare CR.
 - **The pins are configured `GPIO_MODE_INPUT_OUTPUT`, not `GPIO_MODE_OUTPUT`.** An
@@ -124,3 +167,5 @@ blip at power-on.
   after changing it.
 - If stdin errors or hits EOF, the firmware clears the error and retries rather than idling
   for ever, so closing the host port doesn't need a board reset.
+- Neither client keeps the rig in a state of its own: the firmware is the source of truth and
+  reports actual pad levels, so a UI page left open and a CLI command can't disagree.
