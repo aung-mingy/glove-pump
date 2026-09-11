@@ -194,7 +194,8 @@ A silent device costs one `--timeout` and returns `""`.
 | `no reply from device (wrong port, or firmware not running)` | wrong port (see the UART caveat below), firmware not flashed, or the board is held in reset. Raise `--timeout` if the device is slow, lower it if you want fast failures |
 | Reply arrives but the pump doesn't move | pins are driven — check the wiring against the GPIO table in the top-level README |
 | Works after a manual reset, not after flashing | the port was reopened by the flasher mid-run; just re-run the command |
-| `OSError: [Errno 16] Device or resource busy` | something else holds the port — a serial monitor, or a second copy of the CLI / UI. One process per port |
+| `device disconnected: [Errno 5] Input/output error` | the board vanished mid-command (cable, power, hub). Re-run; the desktop app flags and recovers from this on its own |
+| `OSError: [Errno 16] Device or resource busy` | something else holds the port — a serial monitor, or a second copy of the CLI / app. One process per port |
 
 **Wrong-port trap:** on an ESP32-C3-DevKitM-1/DevKitC-1, the connector silked **UART** goes
 through a USB-UART bridge chip and is *not* where the firmware's console lives. The firmware
@@ -219,16 +220,26 @@ a second and renders the answer, so the window shows what the pins actually are 
 what the last click intended — move the rig from the CLI and the window follows.
 
 ```
-┌────────────────────────────────────────────┐
-│ GLOVE-PUMP                                 │
-│ compression                                │
-│ compression pump on, valve on the …        │
-│ ┌────────┐ ┌─────────┐ ┌─────────────────┐ │
-│ │  Off   │ │ Suction │ │   Compression   │ │  <- current state filled green,
-│ └────────┘ └─────────┘ └─────────────────┘ │     others still clickable
-│ valve 1 · compression 1 · suction 0        │
-│ /dev/ttyACM0                               │
-└────────────────────────────────────────────┘
+┌────────────────────────────────────────────────┐
+│ GLOVE-PUMP                                     │
+│ compression                                    │
+│ compression pump on, valve on the …            │
+│ ┌────────┐ ┌─────────┐ ┌─────────────────────┐ │
+│ │  Off   │ │ Suction │ │     Compression     │ │  <- current state filled green,
+│ └────────┘ └─────────┘ └─────────────────────┘ │     others still clickable
+│ valve 1 · compression 1 · suction 0            │
+│ connected · /dev/ttyACM0      [Search for device] │
+└────────────────────────────────────────────────┘
+```
+
+When the board goes away the same line turns red and the buttons grey out:
+
+```
+│ —                                              │  <- no state left to show
+│ ┌────────┐ ┌─────────┐ ┌─────────────────────┐ │
+│ │  Off   │ │ Suction │ │     Compression     │ │  <- all greyed, clicks ignored
+│ └────────┘ └─────────┘ └─────────────────────┘ │
+│ disconnected — searching for the device…  [Search for device] │
 ```
 
 Run:
@@ -240,7 +251,7 @@ python3 host/glove_pump_app.py --port /dev/ttyACM1
 
 | Option | Meaning |
 |---|---|
-| `--port PATH` | serial port; default: first `/dev/ttyACM*`, then `/dev/ttyUSB*` |
+| `--port PATH` | port to try first; default: first `/dev/ttyACM*`, then `/dev/ttyUSB*` |
 
 Notes:
 
@@ -249,12 +260,19 @@ Notes:
   Homebrew builds). Headless box? The CLI covers everything except the buttons.
 - Only three states are offered — the raw `set gpio …` commands stay CLI-only on purpose.
 - A button sends its state name and displays the reply; it never assumes the command worked.
-  An unanswered device shows a red line instead of freezing the window (0.3 s reply timeout,
-  because the poll runs on the Tk thread).
-- Unplugging the board mid-session shows `device gone: …` rather than crashing the app;
-  restart it after replugging.
-- `parse_status()` — turning a device line into (state, pins, error) — is a plain function,
-  so it is checked directly without needing a display (see the Tests section of the top-level
-  README).
+  An unanswered device shows an amber line instead of freezing the window (0.3 s reply
+  timeout, because the poll runs on the Tk thread).
+- **Disconnects are flagged and recovered automatically.** A vanished port (unplug, brownout,
+  re-enumeration) is noticed on the next poll: the window goes red, the buttons grey out, and
+  the app re-scans about every second — trying its last port first, since a re-enumeration can
+  move it to a different number — until the board is back. A port that is still open but stops
+  answering gets one poll of grace before being treated as gone, so one slow reply doesn't
+  drop the connection.
+- **Search for device** does the same scan on demand (and, when it reconnects, immediately
+  re-reads the state). It is a no-op while already connected — deliberately, because
+  re-opening a live CDC-ACM port can trip the board's reset lines and stop your pump.
+- `Link` (the serial side: fd, disconnect detection, port re-scan) contains no Tk, so it runs
+  and is tested headless; `parse_status()` is likewise a plain function. See the Tests section
+  of the top-level README.
 - One process per serially-attached board: stop the CLI or a serial monitor before starting
   the app, and vice versa.

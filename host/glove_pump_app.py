@@ -9,7 +9,9 @@ Suction      GPIO2 (suction pump) high, valve low -> suction pump to output
 Compression  GPIO0 (valve) + GPIO1 (compression pump) high
 
 The window polls the device once a second and shows the state the pins are
-actually in, not what the last click intended.
+actually in, not what the last click intended. If the board disappears — a
+flaky cable or a USB re-enumeration — the window flags it and looks for the
+board again on the next poll; "Search for device" does the same on demand.
 """
 
 import argparse
@@ -27,8 +29,9 @@ BLURB = {
     "suction": "suction pump on, valve on the suction path",
     "compression": "compression pump on, valve on the compression path",
 }
-POLL_MS = 1000
-REPLY_TIMEOUT = 0.3     # short: a dead device must not freeze the window
+POLL_MS = 1000                  # also the reconnect cadence: a lost board is
+REPLY_TIMEOUT = 0.3             # searched for on the next poll, ~1 s later
+MISSES_BEFORE_RECONNECT = 2     # a silent board gets two chances before we re-scan
 
 
 def parse_status(reply):
@@ -48,11 +51,70 @@ def pins_text(pins):
         pins.get("gpio0", "?"), pins.get("gpio1", "?"), pins.get("gpio2", "?"))
 
 
+class Link:
+    """The serial side of the app: holds the fd, notices the board going away,
+    and finds it again. No Tk in here, so it's testable without a display."""
+
+    def __init__(self, port=None):
+        self.port = port            # last port used, or the one --port named
+        self.fd = -1
+        self.misses = 0
+
+    def candidates(self):
+        """The port we had first — a re-enumeration can move it — then whatever
+        is enumerated now."""
+        out = [self.port] if self.port else []
+        return out + [p for p in gp.list_ports() if p not in out]
+
+    def close(self):
+        if self.fd >= 0:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = -1
+
+    def reconnect(self):
+        """Close and look for the board again. True when a port opened."""
+        self.close()
+        for path in self.candidates():
+            try:
+                self.fd = gp.open_port(path)
+            except OSError:
+                continue            # not this one; try the next candidate
+            self.port = path
+            self.misses = 0
+            return True
+        return False
+
+    def tick(self, command="status"):
+        """One cycle: find the board if it's missing, then send `command`.
+        Returns (connected, state, pins, error)."""
+        if self.fd < 0:
+            self.reconnect()
+        if self.fd < 0:
+            return False, None, {}, ""
+        try:
+            reply = gp.command(self.fd, command, REPLY_TIMEOUT)
+        except OSError:             # unplugged: read/write on a dead fd
+            self.close()
+            return False, None, {}, ""
+        if not reply:
+            self.misses += 1
+            if self.misses >= MISSES_BEFORE_RECONNECT:
+                self.close()        # silent board: re-scan on the next tick
+                self.misses = 0
+                return False, None, {}, ""
+            return True, None, {}, "no reply from the device"
+        self.misses = 0
+        state, pins, error = parse_status(reply)
+        return True, state, pins, error
+
+
 class App:
-    def __init__(self, root, fd, port):
+    def __init__(self, root, link):
         self.root = root
-        self.fd = fd
-        self.buttons = {}
+        self.link = link
 
         style = ttk.Style(root)
         style.theme_use("clam")              # lets the active button take a colour
@@ -61,6 +123,7 @@ class App:
         style.map("State.TButton", background=[("active", "#d8d8d8")])
         style.configure("Active.TButton", font=(None, 15, "bold"), padding=(18, 22),
                         background="#0c8", foreground="#031")
+        style.configure("Search.TButton", font=(None, 9), padding=(8, 3))
 
         root.title("glove-pump")
         frame = ttk.Frame(root, padding=20)
@@ -75,9 +138,10 @@ class App:
         self.blurb_label = ttk.Label(frame, text="", foreground="#666")
         self.blurb_label.grid(row=2, column=0, columnspan=3, sticky="w", pady=(0, 16))
 
+        self.buttons = {}
         for col, state in enumerate(STATES):
             button = ttk.Button(frame, text=state.capitalize(), style="State.TButton",
-                                command=lambda s=state: self.send(s))
+                                command=lambda s=state: self.tick(s))
             button.grid(row=3, column=col, padx=(0 if col == 0 else 8, 0), sticky="ew")
             frame.columnconfigure(col, weight=1)
             self.buttons[state] = button
@@ -85,45 +149,51 @@ class App:
         self.pins_label = ttk.Label(frame, text="", font=("monospace", 10),
                                     foreground="#666")
         self.pins_label.grid(row=4, column=0, columnspan=3, sticky="w", pady=(16, 0))
-        self.error_label = ttk.Label(frame, text="", foreground="#c00",
+        self.error_label = ttk.Label(frame, text="", foreground="#c60",
                                      font=(None, 10, "bold"))
         self.error_label.grid(row=5, column=0, columnspan=3, sticky="w")
-        ttk.Label(frame, text=port, font=(None, 8), foreground="#999").grid(
-            row=6, column=0, columnspan=3, sticky="w", pady=(12, 0))
 
+        self.conn_label = ttk.Label(frame, text="", font=(None, 9))
+        self.conn_label.grid(row=6, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        ttk.Button(frame, text="Search for device", style="Search.TButton",
+                   command=self.tick).grid(row=6, column=2, sticky="e", pady=(12, 0))
+
+        self.tick()
         self.poll()
 
-    def send(self, command):
-        try:
-            reply = gp.command(self.fd, command, REPLY_TIMEOUT)
-        except OSError as e:                 # board unplugged mid-session
-            self.show("unknown", {}, "device gone: %s" % e)
-            return
-        self.show(*parse_status(reply))
+    def tick(self, command="status"):
+        """One poll cycle, or a button press (which sends that state instead)."""
+        self.render(*self.link.tick(command))
 
-    def show(self, state, pins, error):
-        self.state_label.config(text=state)
-        self.blurb_label.config(text=BLURB.get(state, "pin combination set by hand"
-                                                if state == "raw" else ""))
+    def render(self, connected, state, pins, error):
+        self.state_label.config(text=state or "—")
+        self.blurb_label.config(text=BLURB.get(state or "", ""))
         self.pins_label.config(text=pins_text(pins) if pins else "")
-        self.error_label.config(text=error)
+        self.error_label.config(text="" if not connected else error)
+        if connected:
+            self.conn_label.config(text="connected · %s" % self.link.port,
+                                   foreground="#2a2")
+        else:
+            self.conn_label.config(
+                text="disconnected — searching for the device…", foreground="#c00")
         for name, button in self.buttons.items():
+            button.state(["!disabled"] if connected else ["disabled"])
             button.configure(style="Active.TButton" if name == state else "State.TButton")
 
     def poll(self):
-        self.send("status")
+        self.tick()
         self.root.after(POLL_MS, self.poll)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--port", help="serial port (default: first /dev/ttyACM*, /dev/ttyUSB*)")
+    ap.add_argument("--port", help="serial port to try first (default: first "
+                                   "/dev/ttyACM*, /dev/ttyUSB*)")
     args = ap.parse_args()
 
-    fd = gp.open_port(gp.find_port(args.port))
     root = tk.Tk()
-    App(root, fd, args.port or gp.find_port())
+    App(root, Link(args.port))
     root.mainloop()
     return 0
 

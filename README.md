@@ -112,8 +112,18 @@ python3 host/glove_pump_app.py --port /dev/ttyACM1
 
 The current state's button is filled green; the others stay clickable. Each of the three
 sends that state name to the firmware and shows the reply — the button never assumes the
-command worked, and an unanswered device turns into a red "no reply" line instead of a
+command worked, and an unanswered device turns into an amber "no reply" line instead of a
 frozen window (0.3 s reply timeout, so a dead board can't lock the UI).
+
+**If the board disappears** (flaky cable, USB re-enumeration, brownout), the window flags it
+in red — `disconnected — searching for the device…` — greys the state buttons out, and looks
+for the board again on the next poll, i.e. about a second later. It retries every second
+while it's missing, trying the port it last used first (the port number can change across a
+re-enumeration) and then whatever is enumerated, and re-enables the buttons when it lands.
+**Search for device** does the same thing on demand. A board that is still open but stops
+answering gets one poll of grace before the app treats it as gone, so a single slow reply
+doesn't drop the connection. After a reconnect the readout shows the board's real state —
+if it reset on the way, that will be `off`, all pins low.
 
 Needs a display and `python3-tk` (`sudo apt install python3-tk` on Debian/Ubuntu — it ships
 with most Python installs, including the python.org and Homebrew ones). For a headless box,
@@ -137,11 +147,17 @@ test. Its fake GPIO also mirrors `gpio_config()`, so it fails if the pins are co
 output-only (every readback reads 0 — that bug shipped once and was caught by the boot
 selftest on hardware).
 
-The Python selftest checks command building and the line framing over a real pty (including
-that raw mode isn't mangling LF into CRLF). The desktop app was exercised against a fake
-device on a pty under Xvfb: the window builds, each button sends the right command and the
-labels/pins/highlight follow the reply, the state refetches after the CLI moved the rig, and
-`parse_status()` — the only non-trivial logic outside Tk — is asserted directly.
+The Python selftest checks command building, that `list_ports()`/`open_port()` raise instead
+of exiting (the app calls them from Tk callbacks and its reconnect loop), and the line
+framing over a real pty (including that raw mode isn't mangling LF into CRLF). The desktop
+app was exercised against fake boards on a pty under Xvfb: the window builds, each button
+sends the right command and the labels/pins/highlight follow the reply, the state refetches
+after the CLI moved the rig, and the whole disconnect path — a silent-but-open port (flagged
+on the first poll, given up on the second) and a vanished port (flagged, fd closed, buttons
+disabled, port re-found, buttons re-enabled). Verified against three mutations of the app:
+never giving up on a silent board, forgetting the lost port when re-scanning, and never
+disabling the buttons — each one fails a check (the first only after the silent-port case was
+added; a closed pty raises EIO, so it exercises the disconnect path, not the timeout path).
 
 The firmware additionally self-checks the real pins at boot: it walks the named states and
 the raw pump path, verifying the pads land where the table says, then logs

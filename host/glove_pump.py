@@ -26,26 +26,35 @@ import time
 PROMPT = "> "
 
 
+def list_ports():
+    """Candidate ports, best first: /dev/ttyACM* then /dev/ttyUSB*."""
+    return sorted(glob.glob("/dev/ttyACM*")) + sorted(glob.glob("/dev/ttyUSB*"))
+
+
 def find_port(explicit=None):
     if explicit:
         return explicit
-    for pattern in ("/dev/ttyACM*", "/dev/ttyUSB*"):
-        candidates = sorted(glob.glob(pattern))
-        if candidates:
-            return candidates[0]
+    ports = list_ports()
+    if ports:
+        return ports[0]
     sys.exit("no serial port found (looked at /dev/ttyACM*, /dev/ttyUSB*) — pass --port")
 
 
 def open_port(path):
-    """Open raw: no echo, no CR/LF translation, no line discipline."""
+    """Open raw: no echo, no CR/LF translation, no line discipline.
+
+    Raises OSError if the path isn't an openable serial port — never exits, so a
+    caller with a UI (or a reconnect loop) can try the next candidate.
+    """
     try:
         fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
     except OSError as e:
-        sys.exit("cannot open %s: %s" % (path, e.strerror))
+        raise OSError("cannot open %s: %s" % (path, e.strerror)) from e
     try:
         a = termios.tcgetattr(fd)
     except termios.error as e:                      # termios.error may lack .strerror
-        sys.exit("%s is not a serial port: %s" % (path, e))
+        os.close(fd)
+        raise OSError("%s is not a serial port: %s" % (path, e)) from e
     a[0] = 0                                        # iflag: no ICRNL/IXON/INLCR
     a[1] = 0                                        # oflag: no ONLCR
     a[2] = termios.CS8 | termios.CREAD | termios.CLOCAL
@@ -104,7 +113,11 @@ def command(fd, cmd, timeout=1.0):
 
 
 def run(fd, cmd, timeout=1.0):
-    out = command(fd, cmd, timeout)
+    try:
+        out = command(fd, cmd, timeout)
+    except OSError as e:                            # board unplugged mid-session
+        print("device disconnected: %s" % e, file=sys.stderr)
+        return 1
     print(out or "no reply from device (wrong port, or firmware not running)")
     return 0 if out.startswith("OK") else 1
 
@@ -127,6 +140,17 @@ def run_selftest():
         except ValueError:
             pass
 
+    # Port discovery and open failures must return/raise, never exit the process:
+    # the desktop app calls these from a Tk callback and from its reconnect loop.
+    assert isinstance(list_ports(), list)
+    assert all(isinstance(p, str) for p in list_ports())
+    for bad in ("/dev/null", "/dev/definitely-not-here"):
+        try:
+            open_port(bad)
+            raise AssertionError("open_port accepted %s" % bad)
+        except OSError:
+            pass
+
     # Framing round trip over a real tty: open_port + write + read_line.
     import pty
     import threading
@@ -140,7 +164,7 @@ def run_selftest():
                 if not data:
                     return
                 if b"toggle" in data:
-                    os.write(master, b"OK gpio1=1 gpio2=0\n")
+                    os.write(master, b"OK suction gpio0=0 gpio1=0 gpio2=1\n")
                 else:
                     os.write(master, b"ERR unknown command\n")
         except OSError:
@@ -148,13 +172,13 @@ def run_selftest():
 
     threading.Thread(target=fake_device, daemon=True).start()
     fd = open_port(os.ttyname(slave))
-    assert command(fd, "toggle") == "OK gpio1=1 gpio2=0", "line framing broken"
+    assert command(fd, "toggle") == "OK suction gpio0=0 gpio1=0 gpio2=1", "line framing broken"
     assert command(fd, "bogus") == "ERR unknown command"
     # raw-mode check: the device sent LF only, so nothing may turn it into CRLF
     os.write(fd, b"toggle\n")
     assert select.select([fd], [], [], 1.0)[0], "no reply"
     raw = os.read(fd, 4096)
-    assert raw == b"OK gpio1=1 gpio2=0\n", "line discipline not raw: %r" % raw
+    assert raw == b"OK suction gpio0=0 gpio1=0 gpio2=1\n", "line discipline not raw: %r" % raw
     os.close(fd)
     os.close(master)
     os.close(slave)
@@ -195,7 +219,12 @@ def main():
         print(e, file=sys.stderr)
         return 2
 
-    fd = open_port(find_port(args.port))
+    fd = find_port(args.port)
+    try:
+        fd = open_port(fd)
+    except OSError as e:
+        print(e, file=sys.stderr)
+        return 1
 
     if cmd:
         return run(fd, cmd, args.timeout)
