@@ -51,11 +51,15 @@ Case-insensitive. `gpio` is optional, and `gpio1` / `gpio2` are accepted as one 
 
 | You type | Wire command | Result |
 |---|---|---|
-| `toggle` | `toggle` | swap which pin is high |
-| `set 1 high` | `set gpio 1 high` | GPIO1 high, GPIO2 low |
-| `set gpio 2 low` | `set gpio 2 low` | GPIO2 low → GPIO1 high |
-| `set gpio1 low` | `set gpio 1 low` | GPIO1 low → GPIO2 high |
+| `toggle` | `toggle` | next state: both low → GPIO1 high → GPIO2 high → both low |
+| `set 1 high` | `set gpio 1 high` | GPIO1 high, GPIO2 dropped if it was high |
+| `set gpio 2 high` | `set gpio 2 high` | GPIO2 high, GPIO1 dropped if it was high |
+| `set gpio1 low` | `set gpio 1 low` | GPIO1 low, GPIO2 left as it is |
+| `set 2 low` | `set gpio 2 low` | GPIO2 low, GPIO1 left as it is |
 | `status` | `status` | report state, change nothing |
+
+Both pins low is a valid state (off); both high is not, and no command can produce it.
+`toggle` from off goes to GPIO1 first.
 
 Anything else is rejected locally, before the port is opened:
 
@@ -74,7 +78,7 @@ Every command prints exactly one line, the device's reply:
 
 ```
 $ ./glove_pump.py toggle
-OK gpio1=0 gpio2=1
+OK gpio1=1 gpio2=0
 ```
 
 | Exit | When |
@@ -95,9 +99,11 @@ way to do a lot of small steps by hand:
 ```
 $ ./glove_pump.py
 > toggle
-OK gpio1=0 gpio2=1
+OK gpio1=1 gpio2=0
 > set 2 high
 OK gpio1=0 gpio2=1
+> set 2 low
+OK gpio1=0 gpio2=0
 > title
 bad command: title (want: toggle | set 1|2 high|low | status)
 > ^D

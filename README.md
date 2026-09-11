@@ -1,12 +1,14 @@
 # glove-pump
 
 ESP32-C3 firmware that takes commands over its **native USB serial port** and drives
-**GPIO1 / GPIO2 as a complementary pair** — exactly one high at any instant.
+**GPIO1 / GPIO2, which may both be low but never both high**. Startup is both low.
 
 ```
 host  ──USB CDC-ACM──▶  ESP32-C3  ──▶  GPIO1 ┐
- (glove_pump.py)                ──▶  GPIO2 ┘  one high, one low, always
+ (glove_pump.py)                ──▶  GPIO2 ┘  never both high
 ```
+
+Three states: both low (off), GPIO1 high, GPIO2 high.
 
 ## Commands
 
@@ -15,17 +17,17 @@ or `ERR <reason>`. Commands are case-insensitive.
 
 | Command | Effect |
 |---|---|
-| `toggle` | swap which pin is high |
-| `set gpio 1 high` | GPIO1 high, GPIO2 low |
-| `set gpio 2 high` | GPIO2 high, GPIO1 low |
-| `set gpio 1 low` | GPIO1 low → **GPIO2 goes high** (see below) |
-| `set gpio 2 low` | GPIO2 low → **GPIO1 goes high** |
+| `toggle` | next state: both low → GPIO1 high → GPIO2 high → both low |
+| `set gpio 1 high` | GPIO1 high — GPIO2 is lowered first if it was high |
+| `set gpio 2 high` | GPIO2 high — GPIO1 is lowered first if it was high |
+| `set gpio 1 low` | GPIO1 low, **GPIO2 untouched** |
+| `set gpio 2 low` | GPIO2 low, **GPIO1 untouched** |
 | `status` | report state, change nothing |
 
-`set ... low` cannot leave both pins low — the pair is complementary by construction, so
-asking for low on one pin drives the other high. `set gpio 1 high` and `set gpio 2 low`
-are the same operation. Switches are break-before-make: both drop before one rises, so
-the pins are never both high, not even for a few microseconds.
+Raising a pin enforces the one rule: if the other pin is high it drops first
+(break-before-make, so the pair is never both high — not even for microseconds). Lowering
+a pin is local, so `set gpio 1 low` twice is a no-op and `set gpio 1 low` while GPIO2 is
+high leaves GPIO2 high. Both low (off) is reached by lowering whichever pin is high.
 
 ## Wiring
 
@@ -84,22 +86,26 @@ gcc -Wall -Wextra -o /tmp/test_glove_pump test/test_glove_pump.c -Itest/stubs &&
 python3 host/glove_pump.py --selftest
 ```
 
-The C test links the real `main/glove_pump.c` against stubbed GPIO and asserts the
-invariant after **every** command path: toggle, both spellings of `set`, uppercase,
-bad pin, bad level, unknown command, blank line. Its fake GPIO mirrors `gpio_config()`,
-so it also fails if the pins are configured output-only (which makes every readback 0 —
-that bug shipped once and was caught by the boot selftest on hardware). The Python
-selftest checks command building and the line framing over a real pty (including that raw
-mode isn't mangling LF into CRLF).
+The C test links the real `main/glove_pump.c` against stubbed GPIO and asserts
+**never both high** after **every** command path: all three `toggle` steps, raising each
+pin (which must drop the other), lowering each pin (which must leave the other alone),
+uppercase, bad pin, bad level, unknown command, blank line. Checked against two deliberate
+mutations — a `drive()` that forgets to clear the other pin, and a `set … low` that raises
+instead of lowering — both fail the test. Its fake GPIO also mirrors `gpio_config()`, so it
+fails if the pins are configured output-only (which makes every readback 0 — that bug
+shipped once and was caught by the boot selftest on hardware). The Python selftest checks
+command building and the line framing over a real pty (including that raw mode isn't
+mangling LF into CRLF).
 
-The firmware additionally runs a self-check on the real pins at every boot and logs
-`selftest PASS gpio1/gpio2 complementary`. It toggles the lines a few times in
-microseconds — delete the `selftest()` call in `app_main()` if your load must not see
-any blip at power-on.
+The firmware additionally runs a self-check on the real pins at every boot: it walks all
+three states and verifies the pads actually land there, logging
+`selftest PASS gpio1/gpio2 land on every state, never both high`. It blips the lines for
+microseconds — delete the `selftest()` call in `app_main()` if your load must not see any
+blip at power-on.
 
 ## Notes
 
-- Power-on state is GPIO1 high, GPIO2 low.
+- Power-on state is both pins low.
 - Lines may end in `\n` (scripts) or `\r` (terminals). The RX line-ending mode is set to
   `ESP_LINE_ENDINGS_CR` because the IDF default (CRLF) stalls the console read on a bare CR.
 - **The pins are configured `GPIO_MODE_INPUT_OUTPUT`, not `GPIO_MODE_OUTPUT`.** An

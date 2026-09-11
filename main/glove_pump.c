@@ -1,13 +1,13 @@
 /*
  * glove-pump — ESP32-C3 dual-GPIO controller over the native USB serial port.
  *
- * GPIO1 / GPIO2 are a complementary pair: exactly one is high at all times.
+ * GPIO1 / GPIO2 may both be low, but never both high. Startup is both low.
  * The host sends line commands; every command answers with the resulting state.
  *
- *   toggle                 swap which pin is high
- *   set gpio 1 high        force GPIO1 high (=> GPIO2 low)
- *   set gpio 1 low         force GPIO1 low  (=> GPIO2 high, invariant > intent)
- *   set gpio 2 high|low    same for GPIO2
+ *   toggle                 next state: both low -> GPIO1 high -> GPIO2 high -> both low
+ *   set gpio 1 high        GPIO1 high (GPIO2 is lowered first if it was high)
+ *   set gpio 2 high        same for GPIO2
+ *   set gpio 1 low         GPIO1 low, GPIO2 untouched (both-low = off)
  *   status                 report state without changing anything
  *
  * Reply: "OK gpio1=<0|1> gpio2=<0|1>" or "ERR <reason>".
@@ -33,9 +33,6 @@
 
 static const char *TAG = "glove-pump";
 
-/* Which pin is currently driven high: 1 => PIN_A, 2 => PIN_B. */
-static int high_side = 1;
-
 static void reply(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 static void reply(const char *fmt, ...)
@@ -53,39 +50,47 @@ static void status(void)
     reply("OK gpio1=%d gpio2=%d", gpio_get_level(PIN_A), gpio_get_level(PIN_B));
 }
 
-/* Drive exactly one pin high. Break-before-make: both drop first, so the pair
- * is never both-high even for a few microseconds — matters if this ever drives
- * an H-bridge. */
+/* Current state, read from the pads: 0 = both low (off), 1 = GPIO1 high,
+ * 2 = GPIO2 high. Both-high is not a state. */
+static int state(void)
+{
+    if (gpio_get_level(PIN_A)) {
+        return 1;
+    }
+    return gpio_get_level(PIN_B) ? 2 : 0;
+}
+
+/* Drive to a state. Break-before-make: both drop first, so the pair is never
+ * both high — not even for a few microseconds. */
 static void drive(int side)
 {
     gpio_set_level(PIN_A, 0);
     gpio_set_level(PIN_B, 0);
-    gpio_set_level(side == 1 ? PIN_A : PIN_B, 1);
-    high_side = side;
+    if (side == 1) {
+        gpio_set_level(PIN_A, 1);
+    } else if (side == 2) {
+        gpio_set_level(PIN_B, 1);
+    }
 }
 
-static void set_high_side(int side)
-{
-    drive(side);
-    status();
-}
-
-/* One runnable check on the invariant that matters, on real hardware.
- * Runs in ~microseconds at boot. Toggles the lines a few times, so delete the
- * call in app_main() if the load must not see any blip at power-on. */
+/* One runnable check on the invariant that matters, on real hardware. Walks
+ * every state and checks the pads actually land there. Runs in microseconds at
+ * boot; delete the call in app_main() if the load must not see a power-on blip. */
 static void selftest(void)
 {
-    for (int i = 0; i < 3; i++) {
-        for (int side = 1; side <= 2; side++) {
-            drive(side);
-            int a = gpio_get_level(PIN_A), b = gpio_get_level(PIN_B);
-            if (a == b) {
-                ESP_LOGE(TAG, "SELFTEST FAIL side=%d gpio1=%d gpio2=%d", side, a, b);
-                return;
-            }
+    static const struct { int side, a, b; } walk[] = {
+        { 0, 0, 0 }, { 1, 1, 0 }, { 2, 0, 1 }, { 0, 0, 0 }, { 2, 0, 1 }, { 1, 1, 0 },
+    };
+    for (size_t i = 0; i < sizeof(walk) / sizeof(walk[0]); i++) {
+        drive(walk[i].side);
+        int a = gpio_get_level(PIN_A), b = gpio_get_level(PIN_B);
+        if (a != walk[i].a || b != walk[i].b) {
+            ESP_LOGE(TAG, "SELFTEST FAIL side=%d got gpio1=%d gpio2=%d want %d/%d",
+                     walk[i].side, a, b, walk[i].a, walk[i].b);
+            return;
         }
     }
-    ESP_LOGI(TAG, "selftest PASS gpio1/gpio2 complementary");
+    ESP_LOGI(TAG, "selftest PASS gpio1/gpio2 land on every state, never both high");
 }
 
 static int parse_pin(const char *s)
@@ -115,7 +120,8 @@ static void handle(char *line)
     }
 
     if (!strcmp(tok[0], "toggle")) {
-        set_high_side(high_side == 1 ? 2 : 1);
+        drive((state() + 1) % 3);       /* off -> GPIO1 -> GPIO2 -> off */
+        status();
         return;
     }
     if (!strcmp(tok[0], "status")) {
@@ -137,9 +143,14 @@ static void handle(char *line)
             reply("ERR level must be high or low");
             return;
         }
-        /* Complementary pair: asking for low on one pin means the other goes
-         * high. There is no state where both are low. */
-        set_high_side(high ? pin : (pin == 1 ? 2 : 1));
+        if (high) {
+            drive(pin);                 /* raising one drops the other first */
+        } else {
+            /* Lowering is local: the other pin keeps its level, so both-low
+             * (off) is reachable and a lowered pin is a no-op otherwise. */
+            gpio_set_level(pin == 1 ? PIN_A : PIN_B, 0);
+        }
+        status();
         return;
     }
     reply("ERR unknown command");
@@ -185,9 +196,9 @@ void app_main(void)
 
     console_init();
 
-    drive(1);                   /* known power-on state: GPIO1 high, GPIO2 low */
+    drive(0);                   /* power-on state: both pins low (off) */
     selftest();
-    drive(1);
+    drive(0);
     ESP_LOGI(TAG, "ready — commands: toggle | set gpio 1|2 high|low | status");
     status();
 

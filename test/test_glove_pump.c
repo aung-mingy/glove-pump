@@ -1,4 +1,4 @@
-/* Command parser + mutual-exclusion test, host-native (no ESP32 attached).
+/* Command parser + never-both-high test, host-native (no ESP32 attached).
  *
  *   gcc -Wall -o /tmp/test_glove_pump test/test_glove_pump.c -Itest/stubs && /tmp/test_glove_pump
  *
@@ -68,11 +68,11 @@ static void reply_grab(void)
 
 #define SEND(cmd) do { char b[sizeof(cmd)]; memcpy(b, cmd, sizeof(cmd)); handle(b); reply_grab(); } while (0)
 
-/* Every command must leave the pair complementary, whatever it returned. */
+/* Both low is legal; both high is not. Checked after every command. */
 #define EXPECT(cmd, want) do {                                  \
         SEND(cmd);                                              \
         assert(!strcmp(out, want));                             \
-        assert(level[1] != level[2]);                           \
+        assert(!(level[1] && level[2]));                        \
     } while (0)
 
 int main(void)
@@ -85,37 +85,53 @@ int main(void)
     /* The firmware's own pin config: output-only mode would make every readback
      * 0 and fail the boot selftest on hardware. */
     assert(gpio_config(&gpio_pins_cfg) == ESP_OK);
-    drive(1);
-    assert(gpio_get_level(PIN_A) == 1 && gpio_get_level(PIN_B) == 0);
+    drive(0);
+    assert(gpio_get_level(PIN_A) == 0 && gpio_get_level(PIN_B) == 0);
 
     reply_reset();
-    SEND("status");
-    assert(!strcmp(out, "OK gpio1=1 gpio2=0"));
+    SEND("status");                         /* startup state: both low */
+    assert(!strcmp(out, "OK gpio1=0 gpio2=0"));
 
-    EXPECT("toggle\n", "OK gpio1=0 gpio2=1");
+    /* toggle walks the three states: off -> GPIO1 -> GPIO2 -> off */
     EXPECT("toggle\n", "OK gpio1=1 gpio2=0");
+    EXPECT("toggle\n", "OK gpio1=0 gpio2=1");
+    EXPECT("toggle\n", "OK gpio1=0 gpio2=0");
 
-    EXPECT("set gpio 2 high\n", "OK gpio1=0 gpio2=1");
-    EXPECT("SET GPIO 2 HIGH\n", "OK gpio1=0 gpio2=1");
-    /* "low" on one pin forces the other high — the invariant wins over intent */
-    EXPECT("set gpio 2 low\n", "OK gpio1=1 gpio2=0");
-    EXPECT("set gpio 1 low\n", "OK gpio1=0 gpio2=1");
+    /* raising one drops the other first — never both high */
     EXPECT("set gpio 1 high\n", "OK gpio1=1 gpio2=0");
+    EXPECT("SET GPIO 2 HIGH\n", "OK gpio1=0 gpio2=1");
+    EXPECT("set gpio 2 high\n", "OK gpio1=0 gpio2=1");
+
+    /* lowering is local: the other pin keeps its level */
+    EXPECT("set gpio 1 low\n", "OK gpio1=0 gpio2=1");   /* GPIO2 still high */
+    EXPECT("set gpio 2 low\n", "OK gpio1=0 gpio2=0");   /* off */
+    EXPECT("set gpio 1 low\n", "OK gpio1=0 gpio2=0");   /* no-op, stays off */
+    EXPECT("set gpio 2 high\n", "OK gpio1=0 gpio2=1");
+    EXPECT("set gpio 1 high\n", "OK gpio1=1 gpio2=0");  /* drops GPIO2 */
+    EXPECT("set gpio 1 low\n", "OK gpio1=0 gpio2=0");   /* off again */
 
     EXPECT("set gpio 3 high\n", "ERR pin must be 1 or 2");
     EXPECT("set gpio 1 sideways\n", "ERR level must be high or low");
+    EXPECT("set gpio 3 low\n", "ERR pin must be 1 or 2");
     EXPECT("frobnicate\n", "ERR unknown command");
 
     reply_reset();
     SEND("\r\n");                            /* half of a CRLF: silence, no state change */
     assert(!strcmp(out, ""));
-    assert(level[1] == 1 && level[2] == 0);
+    assert(level[1] == 0 && level[2] == 0);
 
-    /* every reachable state was complementary, and only ever 0 or 1 */
+    /* both low is fine, only ever one high, and only ever 0 or 1 */
     assert((level[1] == 0 || level[1] == 1) && (level[2] == 0 || level[2] == 1));
+
+    /* the boot selftest's expected walk must match what the commands produce */
+    for (int i = 0; i < 3; i++) {
+        drive(i);
+        assert(!(gpio_get_level(PIN_A) && gpio_get_level(PIN_B)));
+        assert(state() == i);
+    }
 
     fflush(stdout);
     dup2(terminal, STDOUT_FILENO);
-    printf("PASS glove-pump parser + mutual exclusion\n");
+    printf("PASS glove-pump parser + never-both-high\n");
     return 0;
 }
