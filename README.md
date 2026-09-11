@@ -61,7 +61,8 @@ Console config lives in `sdkconfig.defaults`: `CONFIG_ESP_CONSOLE_USB_SERIAL_JTA
 
 ## Host script
 
-`host/glove_pump.py`, stdlib only, no dependencies:
+`host/glove_pump.py`, stdlib only, no dependencies — **[full usage docs in host/README.md](host/README.md)**.
+Short version:
 
 ```bash
 ./host/glove_pump.py toggle
@@ -74,7 +75,7 @@ Console config lives in `sdkconfig.defaults`: `CONFIG_ESP_CONSOLE_USB_SERIAL_JTA
 
 Port auto-detects from `/dev/ttyACM*` then `/dev/ttyUSB*`. It opens raw (no echo, no
 CR/LF translation), drains stale/boot-log lines, then sends one command. Exit status is
-0 for `OK`, 1 for `ERR`/no reply.
+0 for `OK`, 2 for a command it rejected locally, 1 for `ERR`/no reply/port problems.
 
 ## Tests
 

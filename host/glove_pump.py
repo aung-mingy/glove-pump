@@ -39,7 +39,10 @@ def open_port(path):
         fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
     except OSError as e:
         sys.exit("cannot open %s: %s" % (path, e.strerror))
-    a = termios.tcgetattr(fd)
+    try:
+        a = termios.tcgetattr(fd)
+    except termios.error as e:                      # termios.error may lack .strerror
+        sys.exit("%s is not a serial port: %s" % (path, e))
     a[0] = 0                                        # iflag: no ICRNL/IXON/INLCR
     a[1] = 0                                        # oflag: no ONLCR
     a[2] = termios.CS8 | termios.CREAD | termios.CLOCAL
@@ -96,8 +99,8 @@ def command(fd, cmd, timeout=1.0):
     return line
 
 
-def run(fd, cmd):
-    out = command(fd, cmd)
+def run(fd, cmd, timeout=1.0):
+    out = command(fd, cmd, timeout)
     print(out or "no reply from device (wrong port, or firmware not running)")
     return 0 if out.startswith("OK") else 1
 
@@ -146,13 +149,27 @@ def run_selftest():
     os.close(fd)
     os.close(master)
     os.close(slave)
+
+    # --timeout must actually reach the read loop (it silently didn't once)
+    quiet_master, quiet_slave = pty.openpty()
+    fd = open_port(os.ttyname(quiet_slave))
+    started = time.monotonic()
+    assert command(fd, "toggle", 0.2) == ""
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.6, "--timeout ignored: silent device took %.2fs" % elapsed
+    os.close(fd)
+    os.close(quiet_master)
+    os.close(quiet_slave)
+
     print("selftest PASS")
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", nargs=argparse.REMAINDER, help="toggle | set 1|2 high|low | status")
+    # nargs="*", not REMAINDER: REMAINDER would swallow "--port X" typed after
+    # the command words, turning it into part of the command.
+    ap.add_argument("cmd", nargs="*", help="toggle | set 1|2 high|low | status")
     ap.add_argument("--port", help="serial port (default: first /dev/ttyACM*, /dev/ttyUSB*)")
     ap.add_argument("--timeout", type=float, default=1.0, help="reply timeout, seconds")
     ap.add_argument("--selftest", action="store_true", help="run checks, no hardware")
@@ -162,12 +179,20 @@ def main():
         run_selftest()
         return 0
 
+    try:
+        cmd = build_command(args.cmd) if args.cmd else None
+    except ValueError as e:
+        print(e, file=sys.stderr)
+        return 2
+
     fd = open_port(find_port(args.port))
 
-    if args.cmd:
-        return run(fd, build_command(args.cmd))
+    if cmd:
+        return run(fd, cmd, args.timeout)
 
     for line in sys.stdin:                          # interactive
+        if sys.stdin.isatty():
+            print(PROMPT, end="", flush=True)       # piped stdin stays clean
         words = line.split()
         if not words:
             continue
@@ -176,9 +201,9 @@ def main():
         try:
             cmd = build_command(words)
         except ValueError as e:
-            print(e)
+            print(e, file=sys.stderr)
             continue
-        run(fd, cmd)
+        run(fd, cmd, args.timeout)
     return 0
 
 
