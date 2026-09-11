@@ -19,8 +19,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <fcntl.h>
 
 #include "driver/gpio.h"
+#include "driver/usb_serial_jtag.h"
 #include "driver/usb_serial_jtag_vfs.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -143,20 +145,45 @@ static void handle(char *line)
     reply("ERR unknown command");
 }
 
+/* Console setup, following ESP-IDF's examples/system/console/advanced for
+ * CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG. The driver install is not optional: the
+ * no-driver VFS read path polls the RX FIFO once and returns EWOULDBLOCK, so a
+ * blocking fgets() sees EOF immediately and the command loop exits at boot. */
+static void console_init(void)
+{
+    usb_serial_jtag_driver_config_t cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&cfg));
+    usb_serial_jtag_vfs_use_driver();
+
+    /* Bare CR (terminal Enter), bare LF (scripts) and CRLF all end a line. In
+     * the default CRLF mode a lone CR stalls: the VFS blocks looking ahead for
+     * the LF that never comes. */
+    usb_serial_jtag_vfs_set_rx_line_endings(ESP_LINE_ENDINGS_CR);
+
+    /* stdin starts non-blocking, which makes the driver read poll rather than
+     * wait. Clear it so fgets() actually blocks for the next line. */
+    fcntl(fileno(stdin), F_SETFL, 0);
+    fcntl(fileno(stdout), F_SETFL, 0);
+    setvbuf(stdin, NULL, _IONBF, 0);
+}
+
+/* GPIO_MODE_INPUT_OUTPUT, not GPIO_MODE_OUTPUT: an output-only pin has its
+ * input buffer disabled (gpio_config -> gpio_input_disable), so
+ * gpio_get_level() reads back 0 for ever. The boot selftest and status() report
+ * the real pad level, so both directions must be enabled. */
+static const gpio_config_t gpio_pins_cfg = {
+    .pin_bit_mask = (1ULL << PIN_A) | (1ULL << PIN_B),
+    .mode = GPIO_MODE_INPUT_OUTPUT,
+    .pull_up_en = GPIO_PULLUP_DISABLE,
+    .pull_down_en = GPIO_PULLDOWN_DISABLE,
+    .intr_type = GPIO_INTR_DISABLE,
+};
+
 void app_main(void)
 {
-    gpio_config_t cfg = {
-        .pin_bit_mask = (1ULL << PIN_A) | (1ULL << PIN_B),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ESP_ERROR_CHECK(gpio_config(&cfg));
+    ESP_ERROR_CHECK(gpio_config(&gpio_pins_cfg));
 
-    /* Accept a bare CR (terminal Enter), a bare LF (scripts) or CRLF. With the
-     * CRLF default a lone CR would stall the console read. */
-    usb_serial_jtag_vfs_set_rx_line_endings(ESP_LINE_ENDINGS_CR);
+    console_init();
 
     drive(1);                   /* known power-on state: GPIO1 high, GPIO2 low */
     selftest();
@@ -165,13 +192,14 @@ void app_main(void)
     status();
 
     char line[80];
-    while (fgets(line, sizeof(line), stdin)) {
-        handle(line);
-    }
-
-    /* stdin closed: nothing to control any more. Idle instead of spinning. */
-    ESP_LOGW(TAG, "console read failed — idling");
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        if (fgets(line, sizeof(line), stdin)) {
+            handle(line);
+            continue;
+        }
+        /* EOF or read error: drop the error state and wait. A host that closes
+         * the port must not leave the pump dead until the next reset. */
+        clearerr(stdin);
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }

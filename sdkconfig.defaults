@@ -4,5 +4,10 @@ CONFIG_IDF_TARGET="esp32c3"
 # (GPIO18/19) -> host sees a CDC-ACM port (/dev/ttyACM0). No UART, no bridge chip.
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 
+# DevKitM-1/DevKitC-1 boards carry 4 MB. Without this the image header says 2 MB
+# and the ROM warns "Detected size(4096k) larger than the size in the binary
+# image header(2048k)".
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
 # Flash over the same USB port; keep the app small.
 CONFIG_PARTITION_TABLE_SINGLE_APP=y

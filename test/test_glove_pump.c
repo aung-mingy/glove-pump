@@ -14,10 +14,17 @@
 
 /* --- fake GPIO -------------------------------------------------------- */
 static int level[3];
+static int input_enabled[3];
 
+/* Mirrors gpio_config(): the mode decides whether the input buffer is on, and
+ * an output-only pad (GPIO_MODE_OUTPUT, no input bit) reads back 0 for ever. */
 esp_err_t gpio_config(const gpio_config_t *cfg)
 {
-    (void)cfg;
+    for (int pin = 0; pin < 3; pin++) {
+        if (cfg->pin_bit_mask & (1ULL << pin)) {
+            input_enabled[pin] = (cfg->mode & GPIO_MODE_DEF_INPUT) != 0;
+        }
+    }
     return ESP_OK;
 }
 int gpio_set_level(gpio_num_t pin, int l)
@@ -27,10 +34,13 @@ int gpio_set_level(gpio_num_t pin, int l)
 }
 int gpio_get_level(gpio_num_t pin)
 {
-    return level[pin];
+    return input_enabled[pin] ? level[pin] : 0;
 }
 void vTaskDelay(TickType_t t) { (void)t; }
 void usb_serial_jtag_vfs_set_rx_line_endings(esp_line_endings_t m) { (void)m; }
+/* app_main() is compiled but never called here, so these only need to link. */
+esp_err_t usb_serial_jtag_driver_install(usb_serial_jtag_driver_config_t *c) { (void)c; return ESP_OK; }
+void usb_serial_jtag_vfs_use_driver(void) {}
 
 #include "../main/glove_pump.c"
 
@@ -72,7 +82,12 @@ int main(void)
     dup2(cap[1], STDOUT_FILENO);
     fcntl(cap[0], F_SETFL, O_NONBLOCK);
 
-    drive(1);                               /* power-on state */
+    /* The firmware's own pin config: output-only mode would make every readback
+     * 0 and fail the boot selftest on hardware. */
+    assert(gpio_config(&gpio_pins_cfg) == ESP_OK);
+    drive(1);
+    assert(gpio_get_level(PIN_A) == 1 && gpio_get_level(PIN_B) == 0);
+
     reply_reset();
     SEND("status");
     assert(!strcmp(out, "OK gpio1=1 gpio2=0"));

@@ -86,9 +86,11 @@ python3 host/glove_pump.py --selftest
 
 The C test links the real `main/glove_pump.c` against stubbed GPIO and asserts the
 invariant after **every** command path: toggle, both spellings of `set`, uppercase,
-bad pin, bad level, unknown command, blank line. The Python selftest checks command
-building and the line framing over a real pty (including that raw mode isn't mangling
-LF into CRLF).
+bad pin, bad level, unknown command, blank line. Its fake GPIO mirrors `gpio_config()`,
+so it also fails if the pins are configured output-only (which makes every readback 0 —
+that bug shipped once and was caught by the boot selftest on hardware). The Python
+selftest checks command building and the line framing over a real pty (including that raw
+mode isn't mangling LF into CRLF).
 
 The firmware additionally runs a self-check on the real pins at every boot and logs
 `selftest PASS gpio1/gpio2 complementary`. It toggles the lines a few times in
@@ -100,4 +102,19 @@ any blip at power-on.
 - Power-on state is GPIO1 high, GPIO2 low.
 - Lines may end in `\n` (scripts) or `\r` (terminals). The RX line-ending mode is set to
   `ESP_LINE_ENDINGS_CR` because the IDF default (CRLF) stalls the console read on a bare CR.
-- If stdin closes, the firmware idles rather than spinning.
+- **The pins are configured `GPIO_MODE_INPUT_OUTPUT`, not `GPIO_MODE_OUTPUT`.** An
+  output-only pin has its input buffer disabled (`gpio_config()` → `gpio_input_disable()`),
+  so `gpio_get_level()` reads back 0 for ever and the boot selftest fails. Both directions
+  are enabled so `status` reports the real pad level. `test_glove_pump.c` fails if this is
+  reverted.
+- **The USB-Serial-JTAG driver is installed explicitly** (`usb_serial_jtag_driver_install()`
+  + `usb_serial_jtag_vfs_use_driver()`), plus `fcntl(fileno(stdin), F_SETFL, 0)`. Without
+  them the VFS read path polls the RX FIFO once and returns `EWOULDBLOCK`, so `fgets()`
+  sees EOF immediately and the command loop exits during boot. This mirrors ESP-IDF's
+  `examples/system/console/advanced`.
+- 4 MB flash is configured in `sdkconfig.defaults`; otherwise the ROM warns that the image
+  header says 2 MB on a 4 MB part. Editing `sdkconfig.defaults` does **not** update an
+  existing `sdkconfig` — `rm -rf build sdkconfig` and re-run `idf.py set-target esp32c3`
+  after changing it.
+- If stdin errors or hits EOF, the firmware clears the error and retries rather than idling
+  for ever, so closing the host port doesn't need a board reset.
