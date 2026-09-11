@@ -1,11 +1,11 @@
-# host tools — CLI and Flask web UI
+# host tools — CLI and desktop app
 
 Two clients for the ESP32-C3 firmware in this repo, both over its USB serial port:
 
 | File | What |
 |---|---|
 | `glove_pump.py` | CLI: one command per invocation, prints the reply, exits with a usable status |
-| `glove_pump_ui.py` | Flask web UI: three buttons, one per state, plus the live pin levels |
+| `glove_pump_app.py` | tkinter desktop app: three buttons, one per state, plus the live pin levels |
 
 ```bash
 ./glove_pump.py suction
@@ -18,8 +18,8 @@ Two clients for the ESP32-C3 firmware in this repo, both over its USB serial por
 ./glove_pump.py --selftest          # run the script's own checks, no hardware
 ```
 
-The web UI is documented in its own section at the end; it is the only thing in this repo
-that needs a dependency (Flask).
+The desktop app is documented in its own section at the end. Everything here is stdlib — no
+`pip install` anywhere.
 
 ## Requirements (CLI)
 
@@ -212,53 +212,49 @@ real pty, that raw mode doesn't turn LF into CRLF, and that `--timeout` actually
 the read loop. Prints `selftest PASS` and exits 0; any failure raises an `AssertionError`.
 No board required.
 
-## Web UI (Flask) — glove_pump_ui.py
+## Desktop app (tkinter) — glove_pump_app.py
 
-Three buttons, one per state, and the live pin levels. Every page load asks the device for
-`status`, so the page shows what the pins actually are rather than what the last click
-intended — if the CLI moved the rig, the UI follows on its next reload (every 3 s).
+One window, three buttons, one per state, plus the live pin levels. It polls the device once
+a second and renders the answer, so the window shows what the pins actually are rather than
+what the last click intended — move the rig from the CLI and the window follows.
 
 ```
-┌──────────────────────────────┐
-│ GLOVE-PUMP                   │
-│ compression                  │
-│ compression pump on, valve … │
-│ [ Off ] [ Suction ] [ ▓▓Comp ]│   <- current state is highlighted and disabled
-│ valve 1 · compression 1 · suction 0
-└──────────────────────────────┘
-```
-
-Setup — Flask is the repo's only dependency:
-
-```bash
-python3 -m venv ~/.venvs/glove-ui
-~/.venvs/glove-ui/bin/pip install -r host/requirements.txt
+┌────────────────────────────────────────────┐
+│ GLOVE-PUMP                                 │
+│ compression                                │
+│ compression pump on, valve on the …        │
+│ ┌────────┐ ┌─────────┐ ┌─────────────────┐ │
+│ │  Off   │ │ Suction │ │   Compression   │ │  <- current state filled green,
+│ └────────┘ └─────────┘ └─────────────────┘ │     others still clickable
+│ valve 1 · compression 1 · suction 0        │
+│ /dev/ttyACM0                               │
+└────────────────────────────────────────────┘
 ```
 
 Run:
 
 ```bash
-~/.venvs/glove-ui/bin/python host/glove_pump_ui.py                          # 127.0.0.1:8080
-~/.venvs/glove-ui/bin/python host/glove_pump_ui.py --bind 0.0.0.0           # reachable on the LAN
-~/.venvs/glove-ui/bin/python host/glove_pump_ui.py --port /dev/ttyACM1 --http-port 9000
+python3 host/glove_pump_app.py                      # auto-detect the port
+python3 host/glove_pump_app.py --port /dev/ttyACM1
 ```
 
 | Option | Meaning |
 |---|---|
 | `--port PATH` | serial port; default: first `/dev/ttyACM*`, then `/dev/ttyUSB*` |
-| `--bind ADDR` | address to listen on, default `127.0.0.1` |
-| `--http-port N` | HTTP port, default `8080` |
 
 Notes:
 
-- Only three states are offered, and the server rejects anything else with `400` — the raw
-  `set gpio …` commands are CLI-only on purpose.
-- The serial port is guarded by a lock, so a double-clicked button can't interleave two
-  commands on one fd.
-- The reloader is off (`debug=False`) by design: Flask's auto-reloader would fork a second
-  process and open the serial port twice.
-- One process per serially-attached board. Stop the CLI/monitor before starting the UI, and
-  vice versa.
-- `--bind 0.0.0.0` puts an unauthenticated rig controller on the network. Bench LAN only.
-- If you unplug and replug the board, restart the UI — the open fd does not survive the
-  device disappearing.
+- Stdlib only (`tkinter`) — no `pip install`. Needs a display, and `python3-tk`
+  (`sudo apt install python3-tk` on Debian/Ubuntu; it is included in the python.org and
+  Homebrew builds). Headless box? The CLI covers everything except the buttons.
+- Only three states are offered — the raw `set gpio …` commands stay CLI-only on purpose.
+- A button sends its state name and displays the reply; it never assumes the command worked.
+  An unanswered device shows a red line instead of freezing the window (0.3 s reply timeout,
+  because the poll runs on the Tk thread).
+- Unplugging the board mid-session shows `device gone: …` rather than crashing the app;
+  restart it after replugging.
+- `parse_status()` — turning a device line into (state, pins, error) — is a plain function,
+  so it is checked directly without needing a display (see the Tests section of the top-level
+  README).
+- One process per serially-attached board: stop the CLI or a serial monitor before starting
+  the app, and vice versa.

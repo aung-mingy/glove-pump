@@ -1,12 +1,12 @@
 # glove-pump
 
 ESP32-C3 firmware that takes commands over its **native USB serial port** and drives a
-pump/valve rig. Two host clients are included: a CLI and a Flask web UI.
+pump/valve rig. Two host clients are included: a CLI and a desktop app.
 
 ```
 host  ──USB CDC-ACM──▶  ESP32-C3  ──▶  GPIO0  valve
  glove_pump.py                  ──▶  GPIO1  compression pump
- glove_pump_ui.py               ──▶  GPIO2  suction pump
+ glove_pump_app.py              ──▶  GPIO2  suction pump
 ```
 
 ## Three states
@@ -99,23 +99,25 @@ Port auto-detects from `/dev/ttyACM*` then `/dev/ttyUSB*`. It opens raw (no echo
 CR/LF translation), drains stale/boot-log lines, then sends one command. Exit status is
 0 for `OK`, 2 for a command it rejected locally, 1 for `ERR`/no reply/port problems.
 
-## Host web UI (Flask)
+## Host desktop app (tkinter)
 
-`host/glove_pump_ui.py` — three buttons, one per state, plus the live pin levels. It asks the
-device for its state on every page load, so it shows the real pins rather than the last
-click, and reloads itself every 3 s.
+`host/glove_pump_app.py` — one window, three buttons, one per state, plus the live pin
+levels. It polls the device once a second and shows the state the pins are actually in, so
+if the CLI moves the rig the window follows. Stdlib only (`tkinter`), like everything else.
 
 ```bash
-python3 -m venv ~/.venvs/glove-ui
-~/.venvs/glove-ui/bin/pip install -r host/requirements.txt
-~/.venvs/glove-ui/bin/python host/glove_pump_ui.py            # http://127.0.0.1:8080
-~/.venvs/glove-ui/bin/python host/glove_pump_ui.py --bind 0.0.0.0   # reachable on the LAN
-~/.venvs/glove-ui/bin/python host/glove_pump_ui.py --port /dev/ttyACM1 --http-port 9000
+python3 host/glove_pump_app.py                     # auto-detect the port
+python3 host/glove_pump_app.py --port /dev/ttyACM1
 ```
 
-Flask is the only dependency in the repo (`host/requirements.txt`). Nothing else — CLI,
-firmware, tests — needs anything beyond the stdlib. `--bind 0.0.0.0` exposes the rig to
-anyone on the network with no authentication; it's meant for a bench LAN.
+The current state's button is filled green; the others stay clickable. Each of the three
+sends that state name to the firmware and shows the reply — the button never assumes the
+command worked, and an unanswered device turns into a red "no reply" line instead of a
+frozen window (0.3 s reply timeout, so a dead board can't lock the UI).
+
+Needs a display and `python3-tk` (`sudo apt install python3-tk` on Debian/Ubuntu — it ships
+with most Python installs, including the python.org and Homebrew ones). For a headless box,
+the CLI does everything except the buttons.
 
 ## Tests
 
@@ -136,9 +138,10 @@ output-only (every readback reads 0 — that bug shipped once and was caught by 
 selftest on hardware).
 
 The Python selftest checks command building and the line framing over a real pty (including
-that raw mode isn't mangling LF into CRLF). The Flask UI was exercised end to end over HTTP
-against a fake device on a pty: all three buttons, the state round trip, bad-state rejection,
-and the page reflecting the device on reload.
+that raw mode isn't mangling LF into CRLF). The desktop app was exercised against a fake
+device on a pty under Xvfb: the window builds, each button sends the right command and the
+labels/pins/highlight follow the reply, the state refetches after the CLI moved the rig, and
+`parse_status()` — the only non-trivial logic outside Tk — is asserted directly.
 
 The firmware additionally self-checks the real pins at boot: it walks the named states and
 the raw pump path, verifying the pads land where the table says, then logs
