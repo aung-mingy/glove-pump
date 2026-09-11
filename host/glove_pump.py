@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""Control the glove-pump ESP32-C3 over its USB CDC-ACM port. Stdlib only.
+
+    ./glove_pump.py toggle
+    ./glove_pump.py set 1 high
+    ./glove_pump.py set gpio 2 low      # same thing, either spelling
+    ./glove_pump.py status
+    ./glove_pump.py                     # interactive: type commands, ^D to exit
+    ./glove_pump.py --selftest          # no hardware needed
+
+Port is auto-picked from /dev/ttyACM* then /dev/ttyUSB*; override with --port.
+Baud rate is irrelevant: CDC-ACM ignores it.
+"""
+
+import argparse
+import glob
+import os
+import select
+import sys
+import termios
+import time
+
+PROMPT = "> "
+
+
+def find_port(explicit=None):
+    if explicit:
+        return explicit
+    for pattern in ("/dev/ttyACM*", "/dev/ttyUSB*"):
+        candidates = sorted(glob.glob(pattern))
+        if candidates:
+            return candidates[0]
+    sys.exit("no serial port found (looked at /dev/ttyACM*, /dev/ttyUSB*) — pass --port")
+
+
+def open_port(path):
+    """Open raw: no echo, no CR/LF translation, no line discipline."""
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    except OSError as e:
+        sys.exit("cannot open %s: %s" % (path, e.strerror))
+    a = termios.tcgetattr(fd)
+    a[0] = 0                                        # iflag: no ICRNL/IXON/INLCR
+    a[1] = 0                                        # oflag: no ONLCR
+    a[2] = termios.CS8 | termios.CREAD | termios.CLOCAL
+    a[3] = 0                                        # lflag: no ICANON/ECHO
+    a[6][termios.VMIN] = 0
+    a[6][termios.VTIME] = 0
+    termios.tcsetattr(fd, termios.TCSANOW, a)
+    return fd
+
+
+def read_line(fd, timeout=1.0):
+    """One newline-terminated line, or '' on timeout."""
+    buf = bytearray()
+    end = time.monotonic() + timeout
+    while True:
+        left = end - time.monotonic()
+        if left <= 0:
+            break
+        if not select.select([fd], [], [], left)[0]:
+            break
+        chunk = os.read(fd, 4096)
+        if not chunk:
+            break
+        buf += chunk
+        if b"\n" in buf:
+            break
+    return bytes(buf).decode(errors="replace").split("\n")[0].strip()
+
+
+def build_command(tokens):
+    """CLI words -> wire command. Raises ValueError on anything else."""
+    t = [x.lower() for x in tokens]
+    if len(t) > 1 and t[1] == "gpio":
+        t.pop(1)
+    if t in (["toggle"], ["status"]):
+        return t[0]
+    if len(t) == 3 and t[0] == "set" and t[1] in ("1", "2", "gpio1", "gpio2") \
+            and t[2] in ("high", "low"):
+        return "set gpio %s %s" % (t[1][-1], t[2])
+    raise ValueError("bad command: %s (want: toggle | set 1|2 high|low | status)"
+                     % " ".join(tokens))
+
+
+def command(fd, cmd, timeout=1.0):
+    """Send one command, return the device's OK/ERR line ('' on silence)."""
+    while read_line(fd, 0.05):
+        pass                                        # drop boot log / stale replies
+    os.write(fd, (cmd + "\n").encode())
+    line = ""
+    for _ in range(10):                             # skip anything that isn't a reply
+        line = read_line(fd, timeout)
+        if not line or line.startswith(("OK", "ERR")):
+            break
+    return line
+
+
+def run(fd, cmd):
+    out = command(fd, cmd)
+    print(out or "no reply from device (wrong port, or firmware not running)")
+    return 0 if out.startswith("OK") else 1
+
+
+def run_selftest():
+    assert build_command(["toggle"]) == "toggle"
+    assert build_command(["status"]) == "status"
+    assert build_command(["set", "1", "HIGH"]) == "set gpio 1 high"
+    assert build_command(["set", "gpio", "2", "low"]) == "set gpio 2 low"
+    assert build_command(["set", "gpio2", "low"]) == "set gpio 2 low"
+    for bad in ([], ["reboot"], ["set", "3", "high"], ["set", "1", "sideways"]):
+        try:
+            build_command(bad)
+            raise AssertionError("accepted bad command %r" % (bad,))
+        except ValueError:
+            pass
+
+    # Framing round trip over a real tty: open_port + write + read_line.
+    import pty
+    import threading
+
+    master, slave = pty.openpty()
+
+    def fake_device():
+        try:
+            while True:
+                data = os.read(master, 128)
+                if not data:
+                    return
+                if b"toggle" in data:
+                    os.write(master, b"OK gpio1=1 gpio2=0\n")
+                else:
+                    os.write(master, b"ERR unknown command\n")
+        except OSError:
+            pass                                    # master closed at end of test
+
+    threading.Thread(target=fake_device, daemon=True).start()
+    fd = open_port(os.ttyname(slave))
+    assert command(fd, "toggle") == "OK gpio1=1 gpio2=0", "line framing broken"
+    assert command(fd, "bogus") == "ERR unknown command"
+    # raw-mode check: the device sent LF only, so nothing may turn it into CRLF
+    os.write(fd, b"toggle\n")
+    assert select.select([fd], [], [], 1.0)[0], "no reply"
+    raw = os.read(fd, 4096)
+    assert raw == b"OK gpio1=1 gpio2=0\n", "line discipline not raw: %r" % raw
+    os.close(fd)
+    os.close(master)
+    os.close(slave)
+    print("selftest PASS")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("cmd", nargs=argparse.REMAINDER, help="toggle | set 1|2 high|low | status")
+    ap.add_argument("--port", help="serial port (default: first /dev/ttyACM*, /dev/ttyUSB*)")
+    ap.add_argument("--timeout", type=float, default=1.0, help="reply timeout, seconds")
+    ap.add_argument("--selftest", action="store_true", help="run checks, no hardware")
+    args = ap.parse_args()
+
+    if args.selftest:
+        run_selftest()
+        return 0
+
+    fd = open_port(find_port(args.port))
+
+    if args.cmd:
+        return run(fd, build_command(args.cmd))
+
+    for line in sys.stdin:                          # interactive
+        words = line.split()
+        if not words:
+            continue
+        if words[0] in ("quit", "exit"):
+            break
+        try:
+            cmd = build_command(words)
+        except ValueError as e:
+            print(e)
+            continue
+        run(fd, cmd)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,8 @@
+CONFIG_IDF_TARGET="esp32c3"
+
+# Console/command channel on the chip's native USB-Serial-JTAG peripheral
+# (GPIO18/19) -> host sees a CDC-ACM port (/dev/ttyACM0). No UART, no bridge chip.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# Flash over the same USB port; keep the app small.
+CONFIG_PARTITION_TABLE_SINGLE_APP=y
