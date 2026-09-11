@@ -10,8 +10,10 @@ Compression  GPIO0 (valve) + GPIO1 (compression pump) high
 
 The window polls the device once a second and shows the state the pins are
 actually in, not what the last click intended. If the board disappears — a
-flaky cable or a USB re-enumeration — the window flags it and looks for the
-board again on the next poll; "Search for device" does the same on demand.
+flaky cable or a USB re-enumeration — the window flags it and hunts for the
+board again, once a second, for AUTO_SEARCH_ATTEMPTS tries; the status line says
+so while that hunt is running and just "disconnected" once it has stopped.
+"Search for device" searches immediately and restarts the hunt.
 """
 
 import argparse
@@ -32,6 +34,8 @@ BLURB = {
 POLL_MS = 1000                  # also the reconnect cadence: a lost board is
 REPLY_TIMEOUT = 0.3             # searched for on the next poll, ~1 s later
 MISSES_BEFORE_RECONNECT = 2     # a silent board gets two chances before we re-scan
+AUTO_SEARCH_ATTEMPTS = 10       # ~10 s of hunting, then it stops and says so —
+                                # Search for device (or raise this) to try again
 
 
 def parse_status(reply):
@@ -51,6 +55,15 @@ def pins_text(pins):
         pins.get("gpio0", "?"), pins.get("gpio1", "?"), pins.get("gpio2", "?"))
 
 
+def conn_text(connected, port, searching):
+    """The status line. Pure, because the wording is the part that changes."""
+    if connected:
+        return "connected · %s" % port
+    if searching:
+        return "disconnected — searching for the device…"
+    return "disconnected"
+
+
 class Link:
     """The serial side of the app: holds the fd, notices the board going away,
     and finds it again. No Tk in here, so it's testable without a display."""
@@ -59,6 +72,16 @@ class Link:
         self.port = port            # last port used, or the one --port named
         self.fd = -1
         self.misses = 0
+        self.search_tries = 0
+
+    def searching(self):
+        """True while the automatic search is still running."""
+        return self.search_tries < AUTO_SEARCH_ATTEMPTS
+
+    def search(self):
+        """Search now: what the button does. Restarts the automatic attempts."""
+        self.search_tries = 0
+        return self.tick()
 
     def candidates(self):
         """The port we had first — a re-enumeration can move it — then whatever
@@ -75,8 +98,15 @@ class Link:
             self.fd = -1
 
     def reconnect(self):
-        """Close and look for the board again. True when a port opened."""
+        """Close and look for the board again. True when a port opened.
+
+        Stops trying after AUTO_SEARCH_ATTEMPTS failed scans, so a board that
+        stays away doesn't get its ports poked every second for ever.
+        """
+        if not self.searching():
+            return False
         self.close()
+        self.search_tries += 1
         for path in self.candidates():
             try:
                 self.fd = gp.open_port(path)
@@ -84,6 +114,7 @@ class Link:
                 continue            # not this one; try the next candidate
             self.port = path
             self.misses = 0
+            self.search_tries = 0
             return True
         return False
 
@@ -153,10 +184,13 @@ class App:
                                      font=(None, 10, "bold"))
         self.error_label.grid(row=5, column=0, columnspan=3, sticky="w")
 
-        self.conn_label = ttk.Label(frame, text="", font=(None, 9))
+        # width reserves room for the longest status line, so the label can't
+        # grow over the Search button when the text changes
+        self.conn_label = ttk.Label(frame, text="", font=(None, 9), width=44)
         self.conn_label.grid(row=6, column=0, columnspan=2, sticky="w", pady=(12, 0))
         ttk.Button(frame, text="Search for device", style="Search.TButton",
-                   command=self.tick).grid(row=6, column=2, sticky="e", pady=(12, 0))
+                   command=self.search).grid(row=6, column=2, sticky="e",
+                                             padx=(16, 0), pady=(12, 0))
 
         self.tick()
         self.poll()
@@ -165,17 +199,19 @@ class App:
         """One poll cycle, or a button press (which sends that state instead)."""
         self.render(*self.link.tick(command))
 
+    def search(self):
+        """The Search button: look for the board now, and start trying again if
+        the automatic search had given up."""
+        self.render(*self.link.search())
+
     def render(self, connected, state, pins, error):
         self.state_label.config(text=state or "—")
         self.blurb_label.config(text=BLURB.get(state or "", ""))
         self.pins_label.config(text=pins_text(pins) if pins else "")
         self.error_label.config(text="" if not connected else error)
-        if connected:
-            self.conn_label.config(text="connected · %s" % self.link.port,
-                                   foreground="#2a2")
-        else:
-            self.conn_label.config(
-                text="disconnected — searching for the device…", foreground="#c00")
+        self.conn_label.config(text=conn_text(connected, self.link.port,
+                                              self.link.searching()),
+                               foreground="#2a2" if connected else "#c00")
         for name, button in self.buttons.items():
             button.state(["!disabled"] if connected else ["disabled"])
             button.configure(style="Active.TButton" if name == state else "State.TButton")

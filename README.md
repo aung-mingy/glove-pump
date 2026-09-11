@@ -116,14 +116,16 @@ command worked, and an unanswered device turns into an amber "no reply" line ins
 frozen window (0.3 s reply timeout, so a dead board can't lock the UI).
 
 **If the board disappears** (flaky cable, USB re-enumeration, brownout), the window flags it
-in red — `disconnected — searching for the device…` — greys the state buttons out, and looks
-for the board again on the next poll, i.e. about a second later. It retries every second
-while it's missing, trying the port it last used first (the port number can change across a
-re-enumeration) and then whatever is enumerated, and re-enables the buttons when it lands.
-**Search for device** does the same thing on demand. A board that is still open but stops
-answering gets one poll of grace before the app treats it as gone, so a single slow reply
-doesn't drop the connection. After a reconnect the readout shows the board's real state —
-if it reset on the way, that will be `off`, all pins low.
+in red and greys the state buttons out. It searches for the board every second for
+`AUTO_SEARCH_ATTEMPTS` tries (~10 s) — trying the port it last used first, since the port
+number can change across a re-enumeration, then whatever is enumerated — and re-enables the
+buttons when it lands. The status line says `disconnected — searching for the device…` while
+that hunt is running, and drops to plain `disconnected` once it has stopped, so the window
+never claims to be searching when it isn't. **Search for device** searches immediately and
+restarts the automatic attempts. A board that is still open but stops answering gets one poll
+of grace before the app treats it as gone, so a single slow reply doesn't drop the connection.
+After a reconnect the readout shows the board's real state — if it reset on the way, that will
+be `off`, all pins low.
 
 Needs a display and `python3-tk` (`sudo apt install python3-tk` on Debian/Ubuntu — it ships
 with most Python installs, including the python.org and Homebrew ones). For a headless box,
@@ -134,6 +136,7 @@ the CLI does everything except the buttons.
 ```bash
 gcc -Wall -Wextra -o /tmp/test_glove_pump test/test_glove_pump.c -Itest/stubs && /tmp/test_glove_pump
 python3 host/glove_pump.py --selftest
+python3 test/test_app_link.py        # the desktop app's reconnect logic, no display needed
 ```
 
 The C test links the real `main/glove_pump.c` against stubbed GPIO and checks the two
@@ -149,15 +152,20 @@ selftest on hardware).
 
 The Python selftest checks command building, that `list_ports()`/`open_port()` raise instead
 of exiting (the app calls them from Tk callbacks and its reconnect loop), and the line
-framing over a real pty (including that raw mode isn't mangling LF into CRLF). The desktop
-app was exercised against fake boards on a pty under Xvfb: the window builds, each button
-sends the right command and the labels/pins/highlight follow the reply, the state refetches
-after the CLI moved the rig, and the whole disconnect path — a silent-but-open port (flagged
-on the first poll, given up on the second) and a vanished port (flagged, fd closed, buttons
-disabled, port re-found, buttons re-enabled). Verified against three mutations of the app:
-never giving up on a silent board, forgetting the lost port when re-scanning, and never
-disabling the buttons — each one fails a check (the first only after the silent-port case was
-added; a closed pty raises EIO, so it exercises the disconnect path, not the timeout path).
+framing over a real pty (including that raw mode isn't mangling LF into CRLF).
+
+`test/test_app_link.py` covers the app's non-Tk logic against fake boards on ptys, so it needs
+no display: the parse/format helpers, the three status-line wordings, connecting and sending a
+state, a silent-but-open port (flagged on the first poll, given up on the second), a vanished
+port, the automatic search finding a board that comes back on a new port number, the search
+stopping after `AUTO_SEARCH_ATTEMPTS`, no recovery without the button once it has stopped, and
+the button restarting it. Five mutations of the app module were checked against it — never
+giving up, a hardcoded give-up bound, a Search button that doesn't reset the counter, a
+reconnect that ignores the give-up, and `searching()` always true — each fails a check.
+
+Widget rendering ("disconnected — searching…" vs plain "disconnected", buttons greyed out) was
+confirmed by running the real app under Xvfb, unplugging the board under it, and screenshotting
+on both sides of the give-up.
 
 The firmware additionally self-checks the real pins at boot: it walks the named states and
 the raw pump path, verifying the pads land where the table says, then logs

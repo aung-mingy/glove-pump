@@ -264,15 +264,20 @@ Notes:
   timeout, because the poll runs on the Tk thread).
 - **Disconnects are flagged and recovered automatically.** A vanished port (unplug, brownout,
   re-enumeration) is noticed on the next poll: the window goes red, the buttons grey out, and
-  the app re-scans about every second — trying its last port first, since a re-enumeration can
-  move it to a different number — until the board is back. A port that is still open but stops
-  answering gets one poll of grace before being treated as gone, so one slow reply doesn't
-  drop the connection.
-- **Search for device** does the same scan on demand (and, when it reconnects, immediately
-  re-reads the state). It is a no-op while already connected — deliberately, because
-  re-opening a live CDC-ACM port can trip the board's reset lines and stop your pump.
+  the app searches about every second for `AUTO_SEARCH_ATTEMPTS` tries (~10 s) — trying its
+  last port first, since a re-enumeration can move it to a different number — then stops.
+  A port that is still open but stops answering gets one poll of grace first, so one slow reply
+  doesn't drop the connection. `AUTO_SEARCH_ATTEMPTS` is a module constant: raise it for a
+  longer hunt, or set it very high to keep searching for ever.
+- **Search for device** searches immediately and restarts the automatic attempts (it also
+  re-reads the state when it reconnects). While already connected it just refreshes the
+  readout — deliberately, because re-opening a live CDC-ACM port can trip the board's reset
+  lines and stop your pump.
+- The status line is one line of text in three states: `connected · /dev/ttyACM0`,
+  `disconnected — searching for the device…` while the automatic hunt runs, and plain
+  `disconnected` once it has stopped.
 - `Link` (the serial side: fd, disconnect detection, port re-scan) contains no Tk, so it runs
-  and is tested headless; `parse_status()` is likewise a plain function. See the Tests section
-  of the top-level README.
+  and is tested headless — `test/test_app_link.py`. Same for `parse_status()`/`conn_text()`.
+  See the Tests section of the top-level README.
 - One process per serially-attached board: stop the CLI or a serial monitor before starting
   the app, and vice versa.
