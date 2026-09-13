@@ -81,6 +81,12 @@ def sensor_text(pins):
         ohms / 1000.0, closed, pins.get("mv", "?"))
 
 
+def manual_command(pin, high):
+    """The wire command for a manual toggle of GPIO `pin` (0 valve, 1 compression,
+    2 suction). Straight through: the board owns the rules."""
+    return "set gpio %d %s" % (pin, "high" if high else "low")
+
+
 def hold_text(pins):
     """The hold readout, from the hold/err fields. Pure, like the rest."""
     target = pins.get("hold")
@@ -221,17 +227,34 @@ class App:
 
         self.pins_label = ttk.Label(frame, text="", font=("monospace", 10),
                                     foreground="#666")
-        self.pins_label.grid(row=4, column=0, columnspan=3, sticky="w", pady=(16, 0))
+        self.pins_label.grid(row=5, column=0, columnspan=3, sticky="w", pady=(16, 0))
+
+        # Manual per-pin control. These mirror what the board reports, not what was
+        # clicked, and the firmware enforces the one real rule: raising a pump drops
+        # the other one and pairs the valve. No copy of that rule lives here.
+        self.pin_vars = {}
+        self.manual_widgets = []
+        manual = ttk.Frame(frame)
+        manual.grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Label(manual, text="Manual:").pack(side="left")
+        for pin, label in ((0, "Valve"), (1, "Compression"), (2, "Suction")):
+            var = tk.IntVar(value=0)
+            box = ttk.Checkbutton(manual, text=label, variable=var,
+                                  command=lambda p=pin: self.manual(p))
+            box.pack(side="left", padx=(10, 0))
+            self.pin_vars[pin] = var
+            self.manual_widgets.append(box)
+
         self.sensor_label = ttk.Label(frame, text="", font=("monospace", 11))
-        self.sensor_label.grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        self.sensor_label.grid(row=6, column=0, columnspan=3, sticky="w", pady=(6, 0))
         self.hold_label = ttk.Label(frame, text="", font=("monospace", 10),
                                     foreground="#666")
-        self.hold_label.grid(row=6, column=0, columnspan=3, sticky="w")
+        self.hold_label.grid(row=7, column=0, columnspan=3, sticky="w")
 
         # Hold target, in kOhm. The loop itself runs on the board, so this only
         # sends a target and shows the result.
         hold_row = ttk.Frame(frame)
-        hold_row.grid(row=7, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        hold_row.grid(row=8, column=0, columnspan=3, sticky="w", pady=(10, 0))
         ttk.Label(hold_row, text="Hold at").pack(side="left")
         self.target_var = tk.StringVar(value="12.0")
         ttk.Entry(hold_row, textvariable=self.target_var, width=6).pack(side="left", padx=6)
@@ -243,14 +266,14 @@ class App:
 
         self.error_label = ttk.Label(frame, text="", foreground="#c60",
                                      font=(None, 10, "bold"))
-        self.error_label.grid(row=8, column=0, columnspan=3, sticky="w")
+        self.error_label.grid(row=9, column=0, columnspan=3, sticky="w")
 
         # width reserves room for the longest status line, so the label can't
         # grow over the Search button when the text changes
         self.conn_label = ttk.Label(frame, text="", font=(None, 9), width=44)
-        self.conn_label.grid(row=9, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        self.conn_label.grid(row=10, column=0, columnspan=2, sticky="w", pady=(12, 0))
         ttk.Button(frame, text="Search for device", style="Search.TButton",
-                   command=self.search).grid(row=9, column=2, sticky="e",
+                   command=self.search).grid(row=10, column=2, sticky="e",
                                              padx=(16, 0), pady=(12, 0))
 
         self.tick()
@@ -259,6 +282,12 @@ class App:
     def tick(self, command="status"):
         """One poll cycle, or a button press (which sends that state instead)."""
         self.render(*self.link.tick(command))
+
+    def manual(self, pin):
+        """A manual pin toggle: send what the box now says. The board enforces the
+        rule (raising a pump drops the other and pairs the valve), and its reply
+        re-syncs the boxes, so they show the rig and not the click."""
+        self.tick(manual_command(pin, bool(self.pin_vars[pin].get())))
 
     def hold(self):
         """Send the setpoint from the entry, in kOhm. Bad input stays local."""
@@ -290,6 +319,10 @@ class App:
         for name, button in self.buttons.items():
             button.state(["!disabled"] if connected else ["disabled"])
             button.configure(style="Active.TButton" if name == state else "State.TButton")
+        for pin, var in self.pin_vars.items():
+            var.set(int(pins.get("gpio%d" % pin, 0)) if pins else 0)
+        for widget in self.manual_widgets:
+            widget.state(["!disabled"] if connected else ["disabled"])
 
     def poll(self):
         self.tick()

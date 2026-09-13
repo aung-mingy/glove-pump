@@ -123,6 +123,11 @@ check("stalled is called out", app.hold_text({"hold": "stalled", "err": "+2400"}
       "hold stalled — pumps stopped (check the line, then Hold again)")
 check("no hold fields", app.hold_text({"gpio0": "0"}), "")
 
+# --- the manual pin commands -----------------------------------------
+check("raise a pump", app.manual_command(1, True), "set gpio 1 high")
+check("lower a pump", app.manual_command(2, False), "set gpio 2 low")
+check("valve", app.manual_command(0, True), "set gpio 0 high")
+
 # --- the glove readout, against the wiring's two ends ------------------
 check("glove fully open (9k)", app.sensor_text({"r": "9000", "mv": "1350"}),
       "glove 9.0 kΩ · 0% closed (1350 mV)")

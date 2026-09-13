@@ -244,6 +244,13 @@ between, so measure your own ends and put them there. The sensor's own maths (mV
 on the firmware; the app only formats it and flags the two degenerate cases: `r=-1` ("no
 reading — check the GPIO3 wiring") and anything above 100 kΩ ("open circuit").
 
+**Manual pins.** The `Manual:` boxes send `set gpio 0|1|2 high|low` directly — one per line
+(valve, compression, suction). They are a readout as well as a control: each box is set from the
+board's reply, so when you raise a pump the box for the pump the firmware dropped goes clear on
+its own. Nothing about the never-both-pumps rule is implemented in the app — it is enforced on
+the board, for every client, and the app just shows the result. Lowering a pin is local, so
+(valve high, both pumps low) is reachable and reads back as state `raw`.
+
 **Hold controls.** Type a target in kΩ and press **Hold**; **Release** sends `hold off`. The
 loop runs on the board (see the top-level README), so this window is only a monitor: closing
 it, or the laptop sleeping, does not stop the hold. The readout line shows

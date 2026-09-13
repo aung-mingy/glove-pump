@@ -43,9 +43,12 @@ hold=<target|off|stalled> err=<signed ohms>` or `ERR <reason>`, where `<state>` 
 | `hold off` | stop holding (any manual command does this too) |
 | `status` | report state, pins, sensor and hold, change nothing |
 
-The named states are the intended interface (the UI uses only those). `set gpio …` is raw
-bench access: raising a pump still enforces both hardware rules, lowering one leaves the
-valve where it is — which is how you reach a `raw` valve-only combination.
+The named states are the intended interface; the app's three big buttons use only those. Its
+**Manual:** boxes are the raw route — one checkbox per line (valve, compression, suction), each
+sending `set gpio 0|1|2 high|low`. The boxes display what the board reports, not what you
+clicked, so the safety rules stay in one place: raising a pump on the board drops the other one
+and pairs the valve, and the box for the pump that got dropped clears itself on the reply.
+Lowering a pin is local — which is how you reach a valve-only `raw` combination.
 
 ## Hold
 
