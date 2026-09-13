@@ -15,7 +15,8 @@
  *   compression  valve 1  comp 1  suct 0
  *
  * Input:
- *   GPIO3  glove sensor, ADC1 channel 3. Voltage divider:
+ *   GPIO4  glove sensor, ADC1 channel 4 (also MTMS: a JTAG probe would fight
+ *          it, but the console and flashing here are USB-Serial-JTAG, GPIO18/19). Voltage divider:
  *          3.3 V --[13 kOhm]-- tap --[R_var]-- GND, so
  *          mv = 3300 * R / (13000 + R)  and  R = 13000 * mv / (3300 - mv).
  *          ~9 kOhm with the glove fully open (~1350 mV), ~20 kOhm fully closed
@@ -62,13 +63,13 @@
 #define PIN_VALVE GPIO_NUM_0
 #define PIN_COMP  GPIO_NUM_1
 #define PIN_SUCT  GPIO_NUM_2
-#define PIN_SENSE GPIO_NUM_3
+#define PIN_SENSE GPIO_NUM_4
 
 /* Sensor front end. ADC1 only: the C3's ADC2 is not supported by the ADC driver
  * (see the file header), so GPIO5/A5 is unusable even though the board labels it
  * "A5". GPIO0-GPIO4 are the ADC1 pins, and three of them are the pump outputs. */
 #define SENSE_UNIT        ADC_UNIT_1
-#define SENSE_CHANNEL     ADC_CHANNEL_3
+#define SENSE_CHANNEL     ADC_CHANNEL_4
 #define SENSE_ATTEN       ADC_ATTEN_DB_12      /* the tap sits at 1.35-2.0 V */
 #define SENSE_SERIES_OHMS 13000                /* the fixed resistor */
 #define SENSE_VCC_MV      3300                 /* the 3.3 V rail, as wired */
@@ -131,7 +132,7 @@ static void write_pins(bool valve, bool comp, bool suct)
     gpio_set_level(PIN_SUCT, suct);
 }
 
-/* --- glove sensor: 3.3 V --[13 kOhm]-- tap --[R_var]-- GND, tap on GPIO3 --- */
+/* --- glove sensor: 3.3 V --[13 kOhm]-- tap --[R_var]-- GND, tap on GPIO4 --- */
 
 static adc_oneshot_unit_handle_t sense_adc;
 static adc_cali_handle_t sense_cali;
