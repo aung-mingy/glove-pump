@@ -26,8 +26,9 @@ then the pump starts).
 ## Commands
 
 Every line sent to the port gets exactly one line back:
-`OK <state> gpio0=<0|1> gpio1=<0|1> gpio2=<0|1>` or `ERR <reason>`, where `<state>` is
-`off`, `suction`, `compression`, or `raw` for a hand-set pin combination. Case-insensitive.
+`OK <state> gpio0=<0|1> gpio1=<0|1> gpio2=<0|1> adc=<raw> mv=<mV> r=<ohms>` or
+`ERR <reason>`, where `<state>` is `off`, `suction`, `compression`, or `raw` for a hand-set
+pin combination. Case-insensitive.
 
 | Command | Effect |
 |---|---|
@@ -51,6 +52,7 @@ valve where it is — which is how you reach a `raw` valve-only combination.
 | Valve | GPIO0 | plain IO (analog alt: XTAL_32K_P / ADC1_CH0) |
 | Compression pump | GPIO1 | plain IO (analog alt: XTAL_32K_N / ADC1_CH1) |
 | Suction pump | GPIO2 | plain IO (analog alt: ADC1_CH2) |
+| Glove sensor | GPIO5 | **ADC2 channel 0** — ADC1 only reaches GPIO4, so this is the pin |
 | USB D− / D+ | GPIO18 / GPIO19 | fixed; the console and flashing ride on these |
 
 Plug the host into the USB port wired to **GPIO18/19**. On an ESP32-C3-DevKitM-1/DevKitC-1
@@ -65,6 +67,61 @@ Two chip notes:
   a strong external pull-down.
 - GPIO0/GPIO1 are `XTAL_32K_P`/`XTAL_32K_N` (§2, Table 2-6). If your board fits an external
   32.768 kHz crystal on those pins, don't drive them. The Espressif devkits don't.
+
+## Glove sensor
+
+A variable resistor across a fixed 13 kΩ, tapped by the ADC:
+
+```
+3V3 ──[13 kΩ]──┬── GPIO5 (ADC2_CH0)
+               │
+             [R_var]        R_var ≈ 9 kΩ  glove fully open  → ~1350 mV
+               │            R_var ≈ 20 kΩ glove fully closed → ~2000 mV
+              GND
+```
+
+    mv = 3300 · R / (13000 + R)        R = 13000 · mv / (3300 − mv)
+
+The firmware reports all three numbers on every reply — `adc=<raw counts> mv=<mV>
+r=<ohms>` — so the chain can be checked against a multimeter at any point, and the app turns
+`r` into `glove 13.1 kΩ · 37% closed (1655 mV)`. Because the taps are the only thing the app
+knows about your rig, they live in `host/glove_pump_app.py` as `GLOVE_OPEN_OHMS` /
+`GLOVE_CLOSED_OHMS` — measure your own ends and set them there. `r` saturates at 999999 Ω
+(open circuit / no sensor) and is −1 if the ADC read itself failed.
+
+**Identify the pin on your board before trusting the reading.** On an ESP32-C3 Super Mini the
+silkscreen for this pin reads `IO5 / A5 · MISO`, which is three labels for one pin:
+
+- `IO5` and `A5` are the real ones: GPIO5, and ADC2 channel 0 on this chip (ADC1 stops at
+  GPIO4). That is what the firmware uses.
+- `MISO` is the vendor's SPI annotation. SPI signals are routable to any pin through the GPIO
+  matrix, but the chip's *default* (IOMUX) MISO is **GPIO2** — which is the suction pump here.
+  If you ever move this wire to a pin your board ties to MISO by default, you and the pump
+  will fight over it: the readout would then follow the pump state instead of the glove.
+
+Bring-up check, in order:
+1. `glove_pump.py status` with the glove open, then closed — `mv` should land near 1350 → 2000
+   and `r` near 9000 → 20000. Compare `mv` with a multimeter at the tap; they should agree
+   within ~50 mV.
+2. Press Suction and Compression. `r` and `mv` must **not move**. If they do, the sensor is
+   sharing a pin with a pump output — move the wire.
+3. If `mv` sits at 0 or 3300 and freezes, nothing is connected to GPIO5: check the wire, the
+   3V3 end, and the ground.
+
+Notes:
+- GPIO5 is **ADC2**, which the Wi-Fi radio shares. Reads return `r=-1` if this firmware ever
+  starts a radio. It doesn't.
+- The reading is an average of 8 samples, and the ADC uses the chip's eFuse curve-fitting
+  calibration (the scheme differs per chip — that's why the include is `adc_cali_scheme.h`
+  plus a `#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED`). Without burnt eFuse values it falls
+  back to `raw · 3300 / 4095` and says so in the boot log.
+- Jittery reading? A 100 nF from the tap to GND (next to the ADC pin) is the usual fix — it
+  shunts the ADC's switched-capacitor sample-and-hold charge spikes. Your divider's source
+  impedance is 13 kΩ ∥ R ≈ 8 kΩ, which is fine, but wire length isn't.
+- Don't reconfigure this pin as a GPIO. `adc_oneshot_config_channel()` calls
+  `gpio_config_as_analog()`, which *disables* the pin's input and output drivers and leaves it
+  floating — that's why there's no "scan every ADC pin" bring-up command in the firmware: it
+  would silently release GPIO0/1/2 and let the pump driver inputs float.
 
 ## Build and flash
 

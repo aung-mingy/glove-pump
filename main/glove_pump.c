@@ -14,16 +14,25 @@
  *   suction      valve 0  comp 0  suct 1
  *   compression  valve 1  comp 1  suct 0
  *
+ * Input:
+ *   GPIO5  glove sensor, ADC2 channel 0 (also MTDI — see README before wiring
+ *          a JTAG probe). Voltage divider: 3.3 V --[13 kOhm]-- tap --[R]-- GND,
+ *          so  mv = 3300 * R / (13000 + R)  and  R = 13000 * mv / (3300 - mv).
+ *          ~9 kOhm with the glove fully open (~1350 mV), ~20 kOhm fully closed
+ *          (~2000 mV).
+ *
  * Commands (case-insensitive):
  *   off | suction | compression   go to that state
  *   toggle                        off -> suction -> compression -> off
  *   set gpio 0|1|2 high|low       raw pin access; the two pumps can never be
  *                                 high together, and raising a pump sets the
  *                                 valve to match it
- *   status                        report state and pin levels, change nothing
+ *   status                        report state, pins and sensor, change nothing
  *
- * Reply: "OK <state> gpio0=<0|1> gpio1=<0|1> gpio2=<0|1>" or "ERR <reason>",
- * where <state> is off | suction | compression | raw.
+ * Reply: "OK <state> gpio0=<0|1> gpio1=<0|1> gpio2=<0|1> adc=<raw> mv=<mV>
+ * r=<ohms>" or "ERR <reason>", where <state> is off | suction | compression |
+ * raw. adc/mv/r are -1 if the sensor could not be read, r is capped at
+ * 999999 ohms (open circuit / no sensor).
  */
 
 #include <stdarg.h>
@@ -37,6 +46,9 @@
 #include "driver/gpio.h"
 #include "driver/usb_serial_jtag.h"
 #include "driver/usb_serial_jtag_vfs.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+#include "esp_adc/adc_oneshot.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -44,6 +56,17 @@
 #define PIN_VALVE GPIO_NUM_0
 #define PIN_COMP  GPIO_NUM_1
 #define PIN_SUCT  GPIO_NUM_2
+#define PIN_SENSE GPIO_NUM_5
+
+/* Sensor front end. GPIO5 is ADC2 channel 0 on the ESP32-C3 — ADC1 only goes up
+ * to GPIO4, so this is the pin to use for it. */
+#define SENSE_UNIT        ADC_UNIT_2
+#define SENSE_CHANNEL     ADC_CHANNEL_0
+#define SENSE_ATTEN       ADC_ATTEN_DB_12      /* the tap sits at 1.35-2.0 V */
+#define SENSE_SERIES_OHMS 13000                /* the fixed resistor */
+#define SENSE_VCC_MV      3300                 /* the 3.3 V rail, as wired */
+#define SENSE_SAMPLES     8                    /* average: the ADC is noisy */
+#define SENSE_OPEN_OHMS   999999               /* cap for "no sensor"/open */
 
 static const char *TAG = "glove-pump";
 
@@ -84,6 +107,96 @@ static void write_pins(bool valve, bool comp, bool suct)
     gpio_set_level(PIN_SUCT, suct);
 }
 
+/* --- glove sensor: 3.3 V --[13 kOhm]-- tap --[R_var]-- GND, tap on GPIO5 --- */
+
+static adc_oneshot_unit_handle_t sense_adc;
+static adc_cali_handle_t sense_cali;
+static bool sense_ready;
+static bool sense_calibrated;
+
+static void sense_init(void)
+{
+    /* ADC2 (GPIO5). It is shared with the Wi-Fi radio, so reads fail with
+     * ESP_ERR_TIMEOUT if this firmware ever starts a radio. */
+    adc_oneshot_unit_init_cfg_t unit = {
+        .unit_id = SENSE_UNIT,
+        .ulp_mode = ADC_ULP_MODE_DISABLE,
+    };
+    if (adc_oneshot_new_unit(&unit, &sense_adc) != ESP_OK) {
+        ESP_LOGW(TAG, "sensor: no ADC unit — reporting r=-1");
+        return;
+    }
+    adc_oneshot_chan_cfg_t chan = {
+        .atten = SENSE_ATTEN,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    if (adc_oneshot_config_channel(sense_adc, SENSE_CHANNEL, &chan) != ESP_OK) {
+        ESP_LOGW(TAG, "sensor: channel config failed — reporting r=-1");
+        return;
+    }
+#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
+    /* ESP32-C3 uses curve fitting (ESP32 uses line fitting — the scheme header
+     * is per-target). Needs the chip's eFuse calibration values. */
+    adc_cali_curve_fitting_config_t cali = {
+        .unit_id = SENSE_UNIT,
+        .chan = SENSE_CHANNEL,
+        .atten = SENSE_ATTEN,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    if (adc_cali_create_scheme_curve_fitting(&cali, &sense_cali) == ESP_OK) {
+        sense_calibrated = true;
+    } else {
+        ESP_LOGW(TAG, "sensor: no eFuse calibration — falling back to "
+                      "raw * 3300 / 4095 mV");
+    }
+#endif
+    sense_ready = true;
+}
+
+/* The variable resistor, from the tap voltage. Pure arithmetic, so the host test
+ * checks it against the wiring: 1350 mV -> 9000 ohms (glove open),
+ * 2000 mV -> 20000 ohms (glove closed). */
+static int ohms_from_mv(int mv)
+{
+    if (mv <= 0) {
+        return 0;                           /* tap at ground: R ~ 0 */
+    }
+    if (mv >= SENSE_VCC_MV) {
+        return SENSE_OPEN_OHMS;             /* tap at the rail: open circuit */
+    }
+    long ohms = (long)SENSE_SERIES_OHMS * mv / (SENSE_VCC_MV - mv);
+    return ohms > SENSE_OPEN_OHMS ? SENSE_OPEN_OHMS : (int)ohms;
+}
+
+/* Average of SENSE_SAMPLES reads. Both outputs are -1 if it can't be read. */
+static void sense_read(int *raw_out, int *mv_out)
+{
+    *raw_out = -1;
+    *mv_out = -1;
+    if (!sense_ready) {
+        return;
+    }
+    long sum = 0;
+    for (int i = 0; i < SENSE_SAMPLES; i++) {
+        int raw;
+        if (adc_oneshot_read(sense_adc, SENSE_CHANNEL, &raw) != ESP_OK) {
+            return;
+        }
+        sum += raw;
+    }
+    int raw = (int)(sum / SENSE_SAMPLES);
+    int mv;
+    if (sense_calibrated) {
+        if (adc_cali_raw_to_voltage(sense_cali, raw, &mv) != ESP_OK) {
+            return;
+        }
+    } else {
+        mv = raw * SENSE_VCC_MV / 4095;
+    }
+    *raw_out = raw;
+    *mv_out = mv;
+}
+
 /* Index into STATES matching the pads, or -1 for a combination the named states
  * don't cover (reachable only by raw "set gpio 0 ..."). */
 static int current_state(void)
@@ -102,8 +215,12 @@ static int current_state(void)
 static void status(void)
 {
     int i = current_state();
-    reply("OK %s gpio0=%d gpio1=%d gpio2=%d", i < 0 ? "raw" : STATES[i].name,
-          gpio_get_level(PIN_VALVE), gpio_get_level(PIN_COMP), gpio_get_level(PIN_SUCT));
+    int raw, mv;
+    sense_read(&raw, &mv);
+    reply("OK %s gpio0=%d gpio1=%d gpio2=%d adc=%d mv=%d r=%d",
+          i < 0 ? "raw" : STATES[i].name,
+          gpio_get_level(PIN_VALVE), gpio_get_level(PIN_COMP), gpio_get_level(PIN_SUCT),
+          raw, mv, mv < 0 ? -1 : ohms_from_mv(mv));
 }
 
 static void go_to_state(int i)
@@ -262,10 +379,15 @@ void app_main(void)
     ESP_ERROR_CHECK(gpio_config(&gpio_pins_cfg));
 
     console_init();
+    sense_init();
 
     write_pins(false, false, false);    /* power-on state: off */
     selftest();
     write_pins(false, false, false);
+    struct { int raw, mv; } s;
+    sense_read(&s.raw, &s.mv);
+    ESP_LOGI(TAG, "sensor: adc=%d mv=%d r=%d", s.raw, s.mv,
+             s.mv < 0 ? -1 : ohms_from_mv(s.mv));
     ESP_LOGI(TAG, "ready — commands: off | suction | compression | toggle | "
                   "set gpio 0|1|2 high|low | status");
     status();

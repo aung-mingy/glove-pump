@@ -3,9 +3,9 @@
     python3 test/test_app_link.py
 
 No hardware and no display (no Tk), so it runs anywhere:
-  gcc + test_glove_pump.c -> the firmware's rules
+  gcc + test_glove_pump.c -> the firmware's rules and the sensor maths
   host/glove_pump.py --selftest -> the CLI and its line framing
-  this file -> the desktop app's parsing and its disconnect/reconnect logic
+  this file -> the app's parsing, its readouts, and its reconnect logic
 """
 import os
 import pty
@@ -27,6 +27,16 @@ def check(label, got, want):
           ("" if ok else "  want %r" % (want,)))
 
 
+def state(name, valve, comp, suct, raw=1674, mv=1350, ohms=9000):
+    """What Link.tick() returns for one reply: (connected, state, pins, error)."""
+    return (True, name, {"gpio0": str(valve), "gpio1": str(comp), "gpio2": str(suct),
+                         "adc": str(raw), "mv": str(mv), "r": str(ohms)}, "")
+
+
+def offline():
+    return (False, None, {}, "")
+
+
 class Fake:
     """A fake board on a pty. close() is an unplug."""
 
@@ -34,6 +44,7 @@ class Fake:
         self.master, self.slave = pty.openpty()
         self.path = os.ttyname(self.slave)
         self.pins = (0, 0, 0)
+        self.raw, self.mv, self.ohms = 1674, 1350, 9000
         self.seen = []
         self.stop = threading.Event()
         threading.Thread(target=self._serve, daemon=True).start()
@@ -73,7 +84,8 @@ class Fake:
         elif toks[0] != "status":
             return "ERR unknown command"
         name = next((n for n, v in STATES.items() if v == self.pins), "raw")
-        return "OK %s gpio0=%d gpio1=%d gpio2=%d" % ((name,) + self.pins)
+        return "OK %s gpio0=%d gpio1=%d gpio2=%d adc=%d mv=%d r=%d" % (
+            (name,) + self.pins + (self.raw, self.mv, self.ohms))
 
     def close(self):
         self.stop.set()
@@ -85,8 +97,10 @@ class Fake:
 
 
 # --- pure helpers ------------------------------------------------------
-check("parse OK", app.parse_status("OK suction gpio0=0 gpio1=0 gpio2=1"),
-      ("suction", {"gpio0": "0", "gpio1": "0", "gpio2": "1"}, ""))
+check("parse OK", app.parse_status("OK suction gpio0=0 gpio1=0 gpio2=1 "
+                                   "adc=1674 mv=1350 r=9000"),
+      ("suction", {"gpio0": "0", "gpio1": "0", "gpio2": "1",
+                   "adc": "1674", "mv": "1350", "r": "9000"}, ""))
 check("parse ERR", app.parse_status("ERR unknown command"),
       ("unknown", {}, "ERR unknown command"))
 check("parse silence", app.parse_status("")[2].startswith("no reply"), True)
@@ -99,13 +113,31 @@ check("conn text: searching", app.conn_text(False, "/dev/ttyACM0", True),
 check("conn text: search stopped", app.conn_text(False, "/dev/ttyACM0", False),
       "disconnected")
 
+# --- the glove readout, against the wiring's two ends ------------------
+check("glove fully open (9k)", app.sensor_text({"r": "9000", "mv": "1350"}),
+      "glove 9.0 kΩ · 0% closed (1350 mV)")
+check("glove fully closed (20k)", app.sensor_text({"r": "20000", "mv": "2000"}),
+      "glove 20.0 kΩ · 100% closed (2000 mV)")
+check("glove half way", app.sensor_text({"r": "14500", "mv": "1655"}),
+      "glove 14.5 kΩ · 50% closed (1655 mV)")
+check("glove rounds", app.sensor_text({"r": "12400", "mv": "1560"}),
+      "glove 12.4 kΩ · 31% closed (1560 mV)")
+check("below the open end clamps to 0%", app.sensor_text({"r": "5000", "mv": "950"}),
+      "glove 5.0 kΩ · 0% closed (950 mV)")
+check("above the closed end clamps to 100%",
+      app.sensor_text({"r": "44000", "mv": "2540"}),
+      "glove 44.0 kΩ · 100% closed (2540 mV)")
+check("unreadable sensor", app.sensor_text({"r": "-1", "mv": "-1"}),
+      "glove — no reading (check the GPIO5 wiring)")
+check("open circuit", app.sensor_text({"r": "999999", "mv": "3300"}),
+      "glove — open circuit (sensor disconnected?)")
+check("no sensor fields in the reply", app.sensor_text({"gpio0": "0"}), "")
+
 # --- connect, command, disconnect -------------------------------------
 board = Fake()
 link = app.Link(board.path)
-check("connects on the first tick", link.tick(),
-      (True, "off", {"gpio0": "0", "gpio1": "0", "gpio2": "0"}, ""))
-check("sends a state", link.tick("compression"),
-      (True, "compression", {"gpio0": "1", "gpio1": "1", "gpio2": "0"}, ""))
+check("connects on the first tick", link.tick(), state("off", 0, 0, 0))
+check("sends a state", link.tick("compression"), state("compression", 1, 1, 0))
 check("board saw it", board.seen, ["status", "compression"])
 check("reconnect cadence and search window",
       (app.POLL_MS, app.AUTO_SEARCH_ATTEMPTS), (1000, 10))
@@ -115,7 +147,7 @@ quiet_master, quiet_slave = pty.openpty()
 silent = app.Link(os.ttyname(quiet_slave))
 check("silent board: 1st poll flags it",
       silent.tick(), (True, None, {}, "no reply from the device"))
-check("silent board: 2nd poll gives up on it", silent.tick(), (False, None, {}, ""))
+check("silent board: 2nd poll gives up on it", silent.tick(), offline())
 check("silent board: fd closed", silent.fd, -1)
 for fd in (quiet_master, quiet_slave):
     os.close(fd)
@@ -123,7 +155,7 @@ for fd in (quiet_master, quiet_slave):
 # --- the automatic search gives up ------------------------------------
 board.close()
 link.tick()                                     # notices the port going quiet
-check("offline within 2 polls", link.tick(), (False, None, {}, ""))
+check("offline within 2 polls", link.tick(), offline())
 check("still searching", link.searching(), True)
 check("re-scan tries the lost port first", link.candidates()[0], board.path)
 for _ in range(app.AUTO_SEARCH_ATTEMPTS):
@@ -135,12 +167,11 @@ check("label drops the searching wording",
 # a board that comes back on its own is NOT picked up once we've given up...
 late = Fake()
 app.gp.list_ports = lambda: [late.path]
-check("no auto-recovery after giving up", link.tick(), (False, None, {}, ""))
+check("no auto-recovery after giving up", link.tick(), offline())
 check("...and it did not touch the new board", late.seen, [])
 
 # ...until the Search button, which restarts the automatic attempts
-check("Search button reconnects", link.search(),
-      (True, "off", {"gpio0": "0", "gpio1": "0", "gpio2": "0"}, ""))
+check("Search button reconnects", link.search(), state("off", 0, 0, 0))
 check("searching again (counter reset)", link.searching(), True)
 check("label back to connected",
       app.conn_text(True, link.port, link.searching()), "connected · %s" % late.path)

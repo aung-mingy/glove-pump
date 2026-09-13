@@ -91,7 +91,7 @@ Every command prints exactly one line, the device's reply:
 
 ```
 $ ./glove_pump.py suction
-OK suction gpio0=0 gpio1=0 gpio2=1
+OK suction gpio0=0 gpio1=0 gpio2=1 adc=1674 mv=1350 r=9000
 ```
 
 | Exit | When |
@@ -193,6 +193,8 @@ A silent device costs one `--timeout` and returns `""`.
 | `/dev/null is not a serial port: (25, 'Inappropriate ioctl for device')` | `--port` points at something that isn't a tty |
 | `no reply from device (wrong port, or firmware not running)` | wrong port (see the UART caveat below), firmware not flashed, or the board is held in reset. Raise `--timeout` if the device is slow, lower it if you want fast failures |
 | Reply arrives but the pump doesn't move | pins are driven — check the wiring against the GPIO table in the top-level README |
+| `r=9000`…`r=20000` never changes | sensor not on GPIO5, or the wire isn't making contact — see the bring-up checks in the top-level README |
+| `mv` / `r` move when you press Suction or Compression | the sensor is sharing a pin with a pump output (on the C3 the SPI MISO default is GPIO2, our suction line). Move the wire |
 | Works after a manual reset, not after flashing | the port was reopened by the flasher mid-run; just re-run the command |
 | `device disconnected: [Errno 5] Input/output error` | the board vanished mid-command (cable, power, hub). Re-run; the desktop app flags and recovers from this on its own |
 | `OSError: [Errno 16] Device or resource busy` | something else holds the port — a serial monitor, or a second copy of the CLI / app. One process per port |
@@ -215,9 +217,10 @@ No board required.
 
 ## Desktop app (tkinter) — glove_pump_app.py
 
-One window, three buttons, one per state, plus the live pin levels. It polls the device once
-a second and renders the answer, so the window shows what the pins actually are rather than
-what the last click intended — move the rig from the CLI and the window follows.
+One window, three buttons, one per state, the live pin levels, and the glove reading. It polls
+the device once a second and renders the answer, so the window shows what the pins actually
+are rather than what the last click intended — move the rig from the CLI and the window
+follows.
 
 ```
 ┌────────────────────────────────────────────────┐
@@ -228,9 +231,16 @@ what the last click intended — move the rig from the CLI and the window follow
 │ │  Off   │ │ Suction │ │     Compression     │ │  <- current state filled green,
 │ └────────┘ └─────────┘ └─────────────────────┘ │     others still clickable
 │ valve 1 · compression 1 · suction 0            │
+│ glove 13.1 kΩ · 37% closed (1655 mV)           │  <- from the GPIO5 divider
 │ connected · /dev/ttyACM0      [Search for device] │
 └────────────────────────────────────────────────┘
 ```
+
+`glove_pump_app.py` holds `GLOVE_OPEN_OHMS` / `GLOVE_CLOSED_OHMS` (9000 / 20000 by default) —
+those are the "fully open" and "fully closed" resistances that the percentage is scaled
+between, so measure your own ends and put them there. The sensor's own maths (mV → ohms) runs
+on the firmware; the app only formats it and flags the two degenerate cases: `r=-1` ("no
+reading — check the GPIO5 wiring") and anything above 100 kΩ ("open circuit").
 
 When the board goes away the same line turns red and the buttons grey out:
 

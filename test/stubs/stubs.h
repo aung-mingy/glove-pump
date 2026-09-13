@@ -45,6 +45,39 @@ void vTaskDelay(TickType_t ticks);
 typedef enum { ESP_LINE_ENDINGS_CRLF, ESP_LINE_ENDINGS_CR, ESP_LINE_ENDINGS_LF } esp_line_endings_t;
 void usb_serial_jtag_vfs_set_rx_line_endings(esp_line_endings_t mode);
 
+/* --- esp_adc (GPIO5 glove sensor) ------------------------------------- */
+#define ADC_UNIT_2 2
+#define ADC_CHANNEL_0 0
+#define ADC_ATTEN_DB_12 3
+#define ADC_BITWIDTH_DEFAULT 12
+#define ADC_ULP_MODE_DISABLE 0
+#define ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED 1
+
+typedef int adc_unit_t;
+typedef int adc_channel_t;
+typedef int adc_atten_t;
+typedef int adc_bitwidth_t;
+typedef void *adc_oneshot_unit_handle_t;
+typedef void *adc_cali_handle_t;
+
+typedef struct { adc_unit_t unit_id; int ulp_mode; } adc_oneshot_unit_init_cfg_t;
+typedef struct { adc_atten_t atten; adc_bitwidth_t bitwidth; } adc_oneshot_chan_cfg_t;
+typedef struct {
+    adc_unit_t unit_id;
+    adc_channel_t chan;
+    adc_atten_t atten;
+    adc_bitwidth_t bitwidth;
+} adc_cali_curve_fitting_config_t;
+
+esp_err_t adc_oneshot_new_unit(const adc_oneshot_unit_init_cfg_t *cfg,
+                               adc_oneshot_unit_handle_t *out_unit);
+esp_err_t adc_oneshot_config_channel(adc_oneshot_unit_handle_t unit, adc_channel_t chan,
+                                     const adc_oneshot_chan_cfg_t *cfg);
+esp_err_t adc_oneshot_read(adc_oneshot_unit_handle_t unit, adc_channel_t chan, int *out_raw);
+esp_err_t adc_cali_create_scheme_curve_fitting(const adc_cali_curve_fitting_config_t *cfg,
+                                               adc_cali_handle_t *out_handle);
+esp_err_t adc_cali_raw_to_voltage(adc_cali_handle_t handle, int raw, int *out_mv);
+
 typedef struct {
     uint32_t tx_buffer_size;
     uint32_t rx_buffer_size;

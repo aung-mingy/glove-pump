@@ -37,6 +37,13 @@ MISSES_BEFORE_RECONNECT = 2     # a silent board gets two chances before we re-s
 AUTO_SEARCH_ATTEMPTS = 10       # ~10 s of hunting, then it stops and says so —
                                 # Search for device (or raise this) to try again
 
+# The glove sensor, from the wiring: 9 kOhm fully open, 20 kOhm fully closed.
+# Those two numbers are the calibration knobs — measure your own ends and change
+# them here. Above SENSOR_MAX_OHMS we assume nothing is connected.
+GLOVE_OPEN_OHMS = 9000
+GLOVE_CLOSED_OHMS = 20000
+SENSOR_MAX_OHMS = 100000
+
 
 def parse_status(reply):
     """Device reply -> (state, {pin: level}, error). Pure, so it's testable
@@ -53,6 +60,25 @@ def parse_status(reply):
 def pins_text(pins):
     return "valve %s · compression %s · suction %s" % (
         pins.get("gpio0", "?"), pins.get("gpio1", "?"), pins.get("gpio2", "?"))
+
+
+def sensor_text(pins):
+    """The glove readout, from the adc/mv/r fields. Pure, and the maths lives on
+    the firmware side — this only formats and sanity-checks."""
+    if "r" not in pins:
+        return ""
+    try:
+        ohms = int(pins["r"])
+    except ValueError:
+        return "sensor ?"
+    if ohms < 0:
+        return "glove — no reading (check the GPIO5 wiring)"
+    if ohms > SENSOR_MAX_OHMS:
+        return "glove — open circuit (sensor disconnected?)"
+    closed = max(0.0, min(100.0, (ohms - GLOVE_OPEN_OHMS) * 100.0 /
+                              (GLOVE_CLOSED_OHMS - GLOVE_OPEN_OHMS)))
+    return "glove %.1f kΩ · %.0f%% closed (%s mV)" % (
+        ohms / 1000.0, closed, pins.get("mv", "?"))
 
 
 def conn_text(connected, port, searching):
@@ -180,16 +206,18 @@ class App:
         self.pins_label = ttk.Label(frame, text="", font=("monospace", 10),
                                     foreground="#666")
         self.pins_label.grid(row=4, column=0, columnspan=3, sticky="w", pady=(16, 0))
+        self.sensor_label = ttk.Label(frame, text="", font=("monospace", 11))
+        self.sensor_label.grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
         self.error_label = ttk.Label(frame, text="", foreground="#c60",
                                      font=(None, 10, "bold"))
-        self.error_label.grid(row=5, column=0, columnspan=3, sticky="w")
+        self.error_label.grid(row=6, column=0, columnspan=3, sticky="w")
 
         # width reserves room for the longest status line, so the label can't
         # grow over the Search button when the text changes
         self.conn_label = ttk.Label(frame, text="", font=(None, 9), width=44)
-        self.conn_label.grid(row=6, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        self.conn_label.grid(row=7, column=0, columnspan=2, sticky="w", pady=(12, 0))
         ttk.Button(frame, text="Search for device", style="Search.TButton",
-                   command=self.search).grid(row=6, column=2, sticky="e",
+                   command=self.search).grid(row=7, column=2, sticky="e",
                                              padx=(16, 0), pady=(12, 0))
 
         self.tick()
@@ -208,6 +236,7 @@ class App:
         self.state_label.config(text=state or "—")
         self.blurb_label.config(text=BLURB.get(state or "", ""))
         self.pins_label.config(text=pins_text(pins) if pins else "")
+        self.sensor_label.config(text=sensor_text(pins) if pins else "")
         self.error_label.config(text="" if not connected else error)
         self.conn_label.config(text=conn_text(connected, self.link.port,
                                               self.link.searching()),
