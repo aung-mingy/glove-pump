@@ -84,6 +84,11 @@
 #endif
 _Static_assert(PIN_SENSE != PIN_VALVE && PIN_SENSE != PIN_COMP && PIN_SENSE != PIN_SUCT,
                "the sensor and a pump cannot share a pin");
+/* On the ESP32-C3, ADC1 channel N is GPIO N (soc/adc_channel.h), so the pin and
+ * the channel must move together. Change one and you'd silently read a floating
+ * pad: watch for mv=0/mv=3300, which looks exactly like bad wiring. */
+_Static_assert(SENSE_UNIT == ADC_UNIT_1 && SENSE_CHANNEL == PIN_SENSE,
+               "SENSE_CHANNEL must be the ADC1 channel for PIN_SENSE (C3: channel == GPIO)");
 
 static const char *TAG = "glove-pump";
 

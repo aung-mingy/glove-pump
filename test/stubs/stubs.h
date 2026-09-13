@@ -14,6 +14,7 @@ typedef int esp_err_t;
 #define GPIO_NUM_1 1
 #define GPIO_NUM_2 2
 #define GPIO_NUM_3 3
+#define GPIO_NUM_4 4
 #define GPIO_MODE_DEF_INPUT 1
 #define GPIO_MODE_OUTPUT 2
 #define GPIO_MODE_INPUT_OUTPUT 3
@@ -53,8 +54,14 @@ void usb_serial_jtag_vfs_set_rx_line_endings(esp_line_endings_t mode);
  * that's what makes an ADC2 pin a *driver* error on a C3, not a wiring problem. */
 #define ADC_UNIT_1 0
 #define ADC_UNIT_2 1
+/* ADC1 has 5 channels on the C3 (GPIO0-GPIO4), ADC2 has 1 (GPIO5) — define the
+ * whole range, or a stub that only knows the channels we happen to use will
+ * reject a legal pin swap. */
 #define ADC_CHANNEL_0 0
+#define ADC_CHANNEL_1 1
+#define ADC_CHANNEL_2 2
 #define ADC_CHANNEL_3 3
+#define ADC_CHANNEL_4 4
 #define ADC_ATTEN_DB_12 3
 #define ADC_BITWIDTH_DEFAULT 12
 #define ADC_ULP_MODE_DISABLE 0
