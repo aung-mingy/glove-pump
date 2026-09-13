@@ -95,8 +95,27 @@ def build_command(tokens):
             and t[1] in ("0", "1", "2", "gpio0", "gpio1", "gpio2") \
             and t[2] in ("high", "low"):
         return "set gpio %s %s" % (t[1][-1], t[2])
+    if len(t) == 2 and t[0] == "hold":       # len() first: t may be empty
+        if t[1] == "off":
+            return "hold off"
+        ohms = parse_ohms(t[1])
+        if ohms is not None:
+            return "hold %d" % ohms
     raise ValueError("bad command: %s (want: off | suction | compression | toggle | "
-                     "set 0|1|2 high|low | status)" % " ".join(tokens))
+                     "set 0|1|2 high|low | hold <ohms>|12k|off | status)"
+                     % " ".join(tokens))
+
+
+def parse_ohms(word):
+    """'12000' or '12k' -> ohms, or None. Rejects the firmware's own range check."""
+    if word.endswith("k"):
+        word, scale = word[:-1], 1000
+    else:
+        scale = 1
+    try:
+        return int(round(float(word) * scale))
+    except ValueError:
+        return None
 
 
 def command(fd, cmd, timeout=1.0):
@@ -132,8 +151,17 @@ def run_selftest():
     assert build_command(["set", "0", "low"]) == "set gpio 0 low"
     assert build_command(["set", "gpio", "2", "low"]) == "set gpio 2 low"
     assert build_command(["set", "gpio0", "low"]) == "set gpio 0 low"
+    # hold: the target is normalized to whole ohms before it goes on the wire
+    assert build_command(["hold", "off"]) == "hold off"
+    assert build_command(["hold", "12000"]) == "hold 12000"
+    assert build_command(["hold", "12k"]) == "hold 12000"
+    assert build_command(["HOLD", "9.5k"]) == "hold 9500"
+    assert parse_ohms("20k") == 20000
+    assert parse_ohms("1350") == 1350
+    assert parse_ohms("x") is None
     for bad in ([], ["reboot"], ["set", "3", "high"], ["set", "1", "sideways"],
-                ["set", "1"], ["off", "now"]):
+                ["set", "1"], ["off", "now"], ["hold"], ["hold", "soon"],
+                ["hold", "1k", "2k"]):
         try:
             build_command(bad)
             raise AssertionError("accepted bad command %r" % (bad,))
@@ -203,7 +231,7 @@ def main():
     # nargs="*", not REMAINDER: REMAINDER would swallow "--port X" typed after
     # the command words, turning it into part of the command.
     ap.add_argument("cmd", nargs="*", help="off | suction | compression | toggle | "
-                                           "set 0|1|2 high|low | status")
+                    "set 0|1|2 high|low | hold <ohms>|12k|off | status")
     ap.add_argument("--port", help="serial port (default: first /dev/ttyACM*, /dev/ttyUSB*)")
     ap.add_argument("--timeout", type=float, default=1.0, help="reply timeout, seconds")
     ap.add_argument("--selftest", action="store_true", help="run checks, no hardware")

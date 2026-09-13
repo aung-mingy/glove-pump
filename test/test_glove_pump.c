@@ -39,6 +39,21 @@ int gpio_get_level(gpio_num_t pin)
 }
 void vTaskDelay(TickType_t t) { (void)t; }
 void usb_serial_jtag_vfs_set_rx_line_endings(esp_line_endings_t m) { (void)m; }
+
+/* --- fake FreeRTOS: one tick is one ms, the mutex is a no-op ---------- */
+static TickType_t fake_ticks;
+
+SemaphoreHandle_t xSemaphoreCreateMutex(void) { return (SemaphoreHandle_t)1; }
+BaseType_t xSemaphoreTake(SemaphoreHandle_t m, TickType_t t) { (void)m; (void)t; return pdTRUE; }
+BaseType_t xSemaphoreGive(SemaphoreHandle_t m) { (void)m; return pdTRUE; }
+TickType_t xTaskGetTickCount(void) { return fake_ticks; }
+void vTaskDelayUntil(TickType_t *prev, TickType_t period) { *prev += period; fake_ticks += period; }
+BaseType_t xTaskCreate(TaskFunction_t fn, const char *name, uint32_t stack, void *arg,
+                       UBaseType_t prio, TaskHandle_t *out)
+{
+    (void)fn; (void)name; (void)stack; (void)arg; (void)prio; (void)out;
+    return pdPASS;                      /* the harness drives hold_step() itself */
+}
 /* app_main() is compiled but never called here, so these only need to link. */
 esp_err_t usb_serial_jtag_driver_install(usb_serial_jtag_driver_config_t *c) { (void)c; return ESP_OK; }
 void usb_serial_jtag_vfs_use_driver(void) {}
@@ -99,26 +114,46 @@ static void reply_reset(void)
     out[0] = 0;
 }
 
+/* Read until a whole line has arrived: one non-blocking read can return a
+ * partial chunk (or nothing), which turns into a bogus mismatch later on. */
 static void reply_grab(void)
 {
     fflush(stdout);
-    ssize_t n = read(cap[0], out, sizeof(out) - 1);
-    out[n > 0 ? (size_t)n : 0] = 0;
-    if (n > 0) {
-        out[strcspn(out, "\r\n")] = 0;
+    size_t used = 0;
+    while (used < sizeof(out) - 1) {
+        ssize_t n = read(cap[0], out + used, sizeof(out) - 1 - used);
+        if (n <= 0) {
+            break;
+        }
+        used += (size_t)n;
+        out[used] = 0;
+        if (strchr(out, '\n')) {
+            break;
+        }
     }
+    out[strcspn(out, "\r\n")] = 0;
 }
 
-#define SEND(cmd) do { char b[sizeof(cmd)]; memcpy(b, cmd, sizeof(cmd)); handle(b); reply_grab(); } while (0)
+#define SEND(cmd) do {                                                  \
+        reply_reset();                                                  \
+        char b[sizeof(cmd)];                                            \
+        memcpy(b, cmd, sizeof(cmd));                                    \
+        handle(b);                                                      \
+        reply_grab();                                                   \
+    } while (0)
 
-/* Every reply carries the sensor fields too. fake_raw is 1350 from here on, so
- * mv=1350 (glove fully open) and r=9000 — 13000 * 1350 / (3300 - 1350). */
+/* Every reply carries the sensor and hold fields too. fake_raw is 1350 from here
+ * on, so mv=1350 (glove fully open) and r=9000 — 13000 * 1350 / (3300 - 1350). */
 #define SENSOR " adc=1350 mv=1350 r=9000"
+#define HOLD   " hold=off err=+0"
 
 /* The two hardware rules, checked after every command: the pumps are never both
  * high, and the valve is never left on the other pump's path. */
 #define EXPECT(cmd, want) do {                                          \
         SEND(cmd);                                                      \
+        if (strcmp(out, want)) {                                        \
+            fprintf(stderr, "\n  got  <%s>\n  want <%s>\n", out, want); \
+        }                                                               \
         assert(!strcmp(out, want));                                     \
         assert(!(level[PIN_COMP] && level[PIN_SUCT]));                  \
         assert(!(level[PIN_COMP] && !level[PIN_VALVE]));                \
@@ -134,6 +169,7 @@ int main(void)
     /* The firmware's own pin config: output-only mode would make every readback
      * 0 and fail the boot selftest on hardware. */
     gpio_config(&gpio_pins_cfg);
+    hold_lock = xSemaphoreCreateMutex();
     write_pins(false, false, false);
     assert(gpio_get_level(PIN_VALVE) == 0 && gpio_get_level(PIN_COMP) == 0 &&
            gpio_get_level(PIN_SUCT) == 0);
@@ -165,33 +201,33 @@ int main(void)
     fake_raw = 1350;
     reply_reset();
     SEND("status");                             /* startup state: off */
-    assert(!strcmp(out, "OK off gpio0=0 gpio1=0 gpio2=0" SENSOR));
+    assert(!strcmp(out, "OK off gpio0=0 gpio1=0 gpio2=0" SENSOR HOLD));
 
     /* The three named states */
-    EXPECT("suction\n", "OK suction gpio0=0 gpio1=0 gpio2=1" SENSOR);
-    EXPECT("compression\n", "OK compression gpio0=1 gpio1=1 gpio2=0" SENSOR);
-    EXPECT("COMPRESSION\n", "OK compression gpio0=1 gpio1=1 gpio2=0" SENSOR);
-    EXPECT("off\n", "OK off gpio0=0 gpio1=0 gpio2=0" SENSOR);
+    EXPECT("suction\n", "OK suction gpio0=0 gpio1=0 gpio2=1" SENSOR HOLD);
+    EXPECT("compression\n", "OK compression gpio0=1 gpio1=1 gpio2=0" SENSOR HOLD);
+    EXPECT("COMPRESSION\n", "OK compression gpio0=1 gpio1=1 gpio2=0" SENSOR HOLD);
+    EXPECT("off\n", "OK off gpio0=0 gpio1=0 gpio2=0" SENSOR HOLD);
 
     /* toggle cycles off -> suction -> compression -> off */
-    EXPECT("toggle\n", "OK suction gpio0=0 gpio1=0 gpio2=1" SENSOR);
-    EXPECT("toggle\n", "OK compression gpio0=1 gpio1=1 gpio2=0" SENSOR);
-    EXPECT("toggle\n", "OK off gpio0=0 gpio1=0 gpio2=0" SENSOR);
+    EXPECT("toggle\n", "OK suction gpio0=0 gpio1=0 gpio2=1" SENSOR HOLD);
+    EXPECT("toggle\n", "OK compression gpio0=1 gpio1=1 gpio2=0" SENSOR HOLD);
+    EXPECT("toggle\n", "OK off gpio0=0 gpio1=0 gpio2=0" SENSOR HOLD);
 
     /* raw pin commands: raising a pump pairs the valve and drops the other pump */
-    EXPECT("set gpio 1 high\n", "OK compression gpio0=1 gpio1=1 gpio2=0" SENSOR);
-    EXPECT("set gpio 2 high\n", "OK suction gpio0=0 gpio1=0 gpio2=1" SENSOR);
-    EXPECT("set gpio 2 low\n", "OK off gpio0=0 gpio1=0 gpio2=0" SENSOR);
+    EXPECT("set gpio 1 high\n", "OK compression gpio0=1 gpio1=1 gpio2=0" SENSOR HOLD);
+    EXPECT("set gpio 2 high\n", "OK suction gpio0=0 gpio1=0 gpio2=1" SENSOR HOLD);
+    EXPECT("set gpio 2 low\n", "OK off gpio0=0 gpio1=0 gpio2=0" SENSOR HOLD);
 
     /* lowering is local: the valve keeps its position, so a valve-only
      * combination reads back as "raw" */
-    EXPECT("set gpio 1 high\n", "OK compression gpio0=1 gpio1=1 gpio2=0" SENSOR);
-    EXPECT("set gpio 1 low\n", "OK raw gpio0=1 gpio1=0 gpio2=0" SENSOR);
-    EXPECT("set gpio 0 low\n", "OK off gpio0=0 gpio1=0 gpio2=0" SENSOR);
-    EXPECT("set gpio 0 high\n", "OK raw gpio0=1 gpio1=0 gpio2=0" SENSOR);
+    EXPECT("set gpio 1 high\n", "OK compression gpio0=1 gpio1=1 gpio2=0" SENSOR HOLD);
+    EXPECT("set gpio 1 low\n", "OK raw gpio0=1 gpio1=0 gpio2=0" SENSOR HOLD);
+    EXPECT("set gpio 0 low\n", "OK off gpio0=0 gpio1=0 gpio2=0" SENSOR HOLD);
+    EXPECT("set gpio 0 high\n", "OK raw gpio0=1 gpio1=0 gpio2=0" SENSOR HOLD);
 
     /* toggle out of a raw combination goes to off */
-    EXPECT("toggle\n", "OK off gpio0=0 gpio1=0 gpio2=0" SENSOR);
+    EXPECT("toggle\n", "OK off gpio0=0 gpio1=0 gpio2=0" SENSOR HOLD);
 
     EXPECT("set gpio 3 high\n", "ERR pin must be 0, 1 or 2");
     EXPECT("set gpio 1 sideways\n", "ERR level must be high or low");
@@ -202,7 +238,7 @@ int main(void)
     fake_raw = 2000;                            /* fully closed */
     reply_reset();
     SEND("status");
-    assert(!strcmp(out, "OK off gpio0=0 gpio1=0 gpio2=0 adc=2000 mv=2000 r=20000"));
+    assert(!strcmp(out, "OK off gpio0=0 gpio1=0 gpio2=0 adc=2000 mv=2000 r=20000 hold=off err=+0"));
     fake_raw = 0;                               /* tap shorted to ground */
     SEND("status");
     assert(strstr(out, " mv=0 r=0"));
@@ -222,6 +258,128 @@ int main(void)
         assert(current_state() == i);
         assert(!(level[PIN_COMP] && level[PIN_SUCT]));
     }
+    /* hold maps actions to table rows by index, so pin the names down */
+    assert(!strcmp(STATES[action_state(ACT_OFF)].name, "off"));
+    assert(!strcmp(STATES[action_state(ACT_SUCTION)].name, "suction"));
+    assert(!strcmp(STATES[action_state(ACT_COMPRESSION)].name, "compression"));
+
+    /* --- hold: the decision table, driven directly --------------------- */
+    const int TARGET = 12000;
+    hold_state_t st = { 0 };
+    long t = 100000;
+    assert(hold_next(&hold_cfg, &st, TARGET, 12000, t) == ACT_OFF);   /* in band */
+    assert(hold_next(&hold_cfg, &st, TARGET, 11300, t) == ACT_OFF);
+    assert(hold_next(&hold_cfg, &st, TARGET, 12999, t) == ACT_OFF);
+    assert(hold_next(&hold_cfg, &st, TARGET, 13500, t) == ACT_SUCTION);      /* too closed */
+    assert(hold_next(&hold_cfg, &st, TARGET, 10500, t) == ACT_COMPRESSION);  /* too open */
+
+    /* a bite runs to min_on even if the band is reached sooner... */
+    hold_apply(&st, ACT_SUCTION, t);
+    assert(hold_next(&hold_cfg, &st, TARGET, 12000, t + 50) == ACT_SUCTION);
+    assert(hold_next(&hold_cfg, &st, TARGET, 12000, t + 99) == ACT_SUCTION);
+    /* ...then stops */
+    assert(hold_next(&hold_cfg, &st, TARGET, 12000, t + 100) == ACT_OFF);
+    /* and min_off keeps it off even when it is wanted again */
+    hold_apply(&st, ACT_OFF, t + 100);
+    assert(hold_next(&hold_cfg, &st, TARGET, 13500, t + 200) == ACT_OFF);
+    assert(hold_next(&hold_cfg, &st, TARGET, 13500, t + 300) == ACT_SUCTION);
+    /* max_on ends a bite that is still far from the target */
+    hold_apply(&st, ACT_SUCTION, t + 1000);
+    assert(hold_next(&hold_cfg, &st, TARGET, 25000, t + 1100) == ACT_SUCTION);
+    assert(hold_next(&hold_cfg, &st, TARGET, 25000, t + 1400) == ACT_OFF);
+    /* and crossing the target cancels it instead of pumping the wrong way */
+    hold_apply(&st, ACT_SUCTION, t + 2000);
+    assert(hold_next(&hold_cfg, &st, TARGET, 11000, t + 2100) == ACT_OFF);
+
+    /* --- hold: a simulated glove, through the real hold_step() ---------- */
+    /* R responds to the pumps and leaks back toward closed when they are off --
+     * exactly the situation that needs a controller. Counts pump duty and checks
+     * the pin invariant on every tick. Rates are per 50 ms tick: a bite moves
+     * 400 ohms, the leak 40, so one bite stays well inside the 1 kOhm band. */
+    const int BITE = 400, LEAK = 40;
+    fake_ticks = 0;
+    hold_lock = xSemaphoreCreateMutex();
+    int r = 20000;                      /* start closed, target 12k */
+    int duty = 0, ticks = 0, worst = 0;
+    reply_reset();
+    SEND("hold 12k\n");
+    assert(strstr(out, "hold=12000"));
+    for (int i = 0; i < 400; i++) {     /* 20 s at 50 ms */
+        fake_raw = (int)((3300L * r + (SENSE_SERIES_OHMS + r) / 2) /
+                         (SENSE_SERIES_OHMS + r));
+        fake_ticks += HOLD_TICK_MS;
+        hold_step();
+        assert(!(level[PIN_COMP] && level[PIN_SUCT]));      /* the invariant, live */
+        assert(!level[PIN_COMP] || level[PIN_VALVE]);       /* valve follows */
+        assert(!level[PIN_SUCT] || !level[PIN_VALVE]);
+        if (level[PIN_SUCT]) {
+            r -= BITE;                  /* suction opens the glove: R falls */
+            duty++;
+        } else if (level[PIN_COMP]) {
+            r += BITE;
+            duty++;
+        } else {
+            r += LEAK;                  /* leak: air creeps in, glove closes */
+        }
+        if (r < 8000) r = 8000;         /* mechanical end stops */
+        if (r > 21000) r = 21000;
+        ticks++;
+        if (i > 150) {                  /* after settling it holds: the band, plus
+                                         * one tick of leak before the next bite
+                                         * notices, plus the mV quantisation the
+                                         * firmware actually sees (~25 ohms here) */
+            assert(abs(r - TARGET) <= hold_cfg.deadband + LEAK + 50);
+            if (abs(r - TARGET) > worst) {
+                worst = abs(r - TARGET);
+            }
+        }
+    }
+    assert(duty > 0 && duty < ticks);    /* it held by pumping, not by luck */
+    fprintf(stderr, "hold: settled %d ohms (target %d), pumps on %d/%d ticks, worst error %d ohms\n",
+           r, TARGET, duty, ticks, worst);
+    SEND("hold off\n");
+    assert(hold_target == 0);
+
+    /* a pump that moves nothing must end with the pumps off, not pumping for ever */
+    fake_ticks = 0;
+    hold_target = TARGET;
+    hold_stalled = false;
+    hold_best_err = INT_MAX;
+    hold_best_ms = 0;
+    hold_st.action = ACT_OFF;
+    for (int i = 0; i < 500; i++) {      /* 25 s of a dead pump */
+        fake_raw = 1350;                 /* sensor fine: 9 kOhm, far from 12 kOhm */
+        fake_ticks += HOLD_TICK_MS;
+        hold_step();
+    }
+    assert(hold_target == 0 && hold_stalled);
+    assert(level[PIN_COMP] == 0 && level[PIN_SUCT] == 0 && level[PIN_VALVE] == 0);
+
+    /* an unreadable sensor stops the loop rather than pumping blind */
+    fake_ticks = 0;
+    hold_target = TARGET;
+    hold_stalled = false;
+    hold_best_err = INT_MAX;
+    hold_best_ms = 0;
+    hold_st.action = ACT_OFF;
+    fake_raw = -1;
+    fake_ticks += HOLD_TICK_MS;
+    hold_step();
+    assert(hold_target == 0 && hold_stalled);
+    assert(level[PIN_COMP] == 0 && level[PIN_SUCT] == 0);
+    fake_raw = 1350;
+
+    /* manual commands take the rig back from the loop */
+    hold_target = TARGET;
+    SEND("off\n");
+    assert(hold_target == 0);
+    hold_target = TARGET;
+    SEND("set gpio 1 high\n");
+    assert(hold_target == 0);
+    SEND("off\n");
+    SEND("status\n");
+    assert(strstr(out, "hold=off"));
+    fake_raw = 1350;
 
     fflush(stdout);
     dup2(terminal, STDOUT_FILENO);

@@ -113,6 +113,16 @@ check("conn text: searching", app.conn_text(False, "/dev/ttyACM0", True),
 check("conn text: search stopped", app.conn_text(False, "/dev/ttyACM0", False),
       "disconnected")
 
+# --- the hold readout -------------------------------------------------
+check("hold off", app.hold_text({"hold": "off", "err": "+0"}), "hold off")
+check("holding", app.hold_text({"hold": "12000", "err": "+320"}),
+      "holding at 12.0 kΩ · error +320 Ω")
+check("holding, too open", app.hold_text({"hold": "9500", "err": "-1100"}),
+      "holding at 9.5 kΩ · error -1100 Ω")
+check("stalled is called out", app.hold_text({"hold": "stalled", "err": "+2400"}),
+      "hold stalled — pumps stopped (check the line, then Hold again)")
+check("no hold fields", app.hold_text({"gpio0": "0"}), "")
+
 # --- the glove readout, against the wiring's two ends ------------------
 check("glove fully open (9k)", app.sensor_text({"r": "9000", "mv": "1350"}),
       "glove 9.0 kΩ · 0% closed (1350 mV)")

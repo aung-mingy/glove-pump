@@ -81,6 +81,22 @@ def sensor_text(pins):
         ohms / 1000.0, closed, pins.get("mv", "?"))
 
 
+def hold_text(pins):
+    """The hold readout, from the hold/err fields. Pure, like the rest."""
+    target = pins.get("hold")
+    if target is None:
+        return ""
+    if target == "off":
+        return "hold off"
+    if target == "stalled":
+        return "hold stalled — pumps stopped (check the line, then Hold again)"
+    try:
+        err = int(pins.get("err", "0"))
+    except ValueError:
+        err = 0
+    return "holding at %.1f kΩ · error %+d Ω" % (int(target) / 1000.0, err)
+
+
 def conn_text(connected, port, searching):
     """The status line. Pure, because the wording is the part that changes."""
     if connected:
@@ -208,16 +224,33 @@ class App:
         self.pins_label.grid(row=4, column=0, columnspan=3, sticky="w", pady=(16, 0))
         self.sensor_label = ttk.Label(frame, text="", font=("monospace", 11))
         self.sensor_label.grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        self.hold_label = ttk.Label(frame, text="", font=("monospace", 10),
+                                    foreground="#666")
+        self.hold_label.grid(row=6, column=0, columnspan=3, sticky="w")
+
+        # Hold target, in kOhm. The loop itself runs on the board, so this only
+        # sends a target and shows the result.
+        hold_row = ttk.Frame(frame)
+        hold_row.grid(row=7, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Label(hold_row, text="Hold at").pack(side="left")
+        self.target_var = tk.StringVar(value="12.0")
+        ttk.Entry(hold_row, textvariable=self.target_var, width=6).pack(side="left", padx=6)
+        ttk.Label(hold_row, text="kΩ").pack(side="left")
+        ttk.Button(hold_row, text="Hold", style="Search.TButton",
+                   command=self.hold).pack(side="left", padx=(10, 0))
+        ttk.Button(hold_row, text="Release", style="Search.TButton",
+                   command=lambda: self.tick("hold off")).pack(side="left", padx=6)
+
         self.error_label = ttk.Label(frame, text="", foreground="#c60",
                                      font=(None, 10, "bold"))
-        self.error_label.grid(row=6, column=0, columnspan=3, sticky="w")
+        self.error_label.grid(row=8, column=0, columnspan=3, sticky="w")
 
         # width reserves room for the longest status line, so the label can't
         # grow over the Search button when the text changes
         self.conn_label = ttk.Label(frame, text="", font=(None, 9), width=44)
-        self.conn_label.grid(row=7, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        self.conn_label.grid(row=9, column=0, columnspan=2, sticky="w", pady=(12, 0))
         ttk.Button(frame, text="Search for device", style="Search.TButton",
-                   command=self.search).grid(row=7, column=2, sticky="e",
+                   command=self.search).grid(row=9, column=2, sticky="e",
                                              padx=(16, 0), pady=(12, 0))
 
         self.tick()
@@ -226,6 +259,18 @@ class App:
     def tick(self, command="status"):
         """One poll cycle, or a button press (which sends that state instead)."""
         self.render(*self.link.tick(command))
+
+    def hold(self):
+        """Send the setpoint from the entry, in kOhm. Bad input stays local."""
+        try:
+            ohms = int(round(float(self.target_var.get()) * 1000))
+        except ValueError:
+            self.error_label.config(text="hold needs a number of kΩ, e.g. 12.0")
+            return
+        if not 1000 <= ohms <= 100000:
+            self.error_label.config(text="hold target must be 1–100 kΩ")
+            return
+        self.tick("hold %d" % ohms)
 
     def search(self):
         """The Search button: look for the board now, and start trying again if
@@ -237,6 +282,7 @@ class App:
         self.blurb_label.config(text=BLURB.get(state or "", ""))
         self.pins_label.config(text=pins_text(pins) if pins else "")
         self.sensor_label.config(text=sensor_text(pins) if pins else "")
+        self.hold_label.config(text=hold_text(pins) if pins else "")
         self.error_label.config(text="" if not connected else error)
         self.conn_label.config(text=conn_text(connected, self.link.port,
                                               self.link.searching()),

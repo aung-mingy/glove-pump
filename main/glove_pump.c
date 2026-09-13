@@ -33,16 +33,20 @@
  *   set gpio 0|1|2 high|low       raw pin access; the two pumps can never be
  *                                 high together, and raising a pump sets the
  *                                 valve to match it
- *   status                        report state, pins and sensor, change nothing
+ *   hold <ohms> | hold 12k        closed loop: pulse the pumps to keep the
+ *   hold off                      sensor near a target the host sets. Any
+ *                                 manual command takes the rig back
+ *   status                        report state, pins, sensor and hold
  *
  * Reply: "OK <state> gpio0=<0|1> gpio1=<0|1> gpio2=<0|1> adc=<raw> mv=<mV>
- * r=<ohms>" or "ERR <reason>", where <state> is off | suction | compression |
- * raw. adc/mv/r are -1 if the sensor could not be read, r is capped at
- * 999999 ohms (open circuit / no sensor).
+ * r=<ohms> hold=<target|off|stalled> err=<signed ohms>" or "ERR <reason>", where
+ * <state> is off | suction | compression | raw. adc/mv/r are -1 if the sensor
+ * could not be read, r is capped at 999999 ohms (open circuit / no sensor).
  */
 
 #include <stdarg.h>
 #include <stdbool.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -57,6 +61,7 @@
 #include "esp_adc/adc_oneshot.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "soc/soc_caps.h"
 
@@ -92,6 +97,23 @@ _Static_assert(PIN_SENSE != PIN_VALVE && PIN_SENSE != PIN_COMP && PIN_SENSE != P
  * -Werror=enum-compare) */
 _Static_assert((int)SENSE_UNIT == (int)ADC_UNIT_1 && (int)SENSE_CHANNEL == (int)PIN_SENSE,
                "SENSE_CHANNEL must be the ADC1 channel for PIN_SENSE (C3: channel == GPIO)");
+
+/* Hold: keep the sensor near a target the host sets. The pumps are on/off, so
+ * this is a deadband plus dwell times, not PID - the leak does the work in the
+ * other direction for free, so only one pump ever fires per target and a small
+ * overshoot decays back on its own. All knobs in ms: a bite shorter than the
+ * pump's spin-up is wasted, one longer than needed overshoots the band. */
+#define HOLD_DEADBAND_OHMS 1000     /* +/- 1 kOhm, as asked for */
+#define HOLD_MIN_OHMS      1000     /* sane targets only */
+#define HOLD_MAX_OHMS      100000   /* above this the tap is within a few mV of the
+                                     * rail, so the divider can't tell you anything */
+#define HOLD_MIN_ON_MS     100      /* one bite must move LESS than the band and
+                                     * more than the pump's spin-up: this is the
+                                     * knob to turn on the real rig */
+#define HOLD_MIN_OFF_MS    200      /* rest between bites: no chatter, no valve flap */
+#define HOLD_MAX_ON_MS     400      /* one bite at most: caps the overshoot */
+#define HOLD_STALL_MS      15000    /* no progress this long -> stop and say so */
+#define HOLD_TICK_MS       50
 
 static const char *TAG = "glove-pump";
 
@@ -226,6 +248,153 @@ static void sense_read(int *raw_out, int *mv_out)
     *mv_out = mv;
 }
 
+/* --- hold: deadband + dwell, one direction at a time ---------------------- */
+
+typedef enum { ACT_OFF, ACT_SUCTION, ACT_COMPRESSION } action_t;
+
+typedef struct {
+    int deadband;               /* ohms */
+    int min_on_ms;
+    int min_off_ms;
+    int max_on_ms;
+} hold_cfg_t;
+
+typedef struct {
+    action_t action;            /* what the pumps are doing now */
+    long action_started_ms;     /* when action last became non-OFF */
+    long last_change_ms;        /* when action last changed at all */
+} hold_state_t;
+
+/* Pure: no I/O, no clock, no globals, so the host test drives it directly.
+ * err > 0 means R is above the target, i.e. more closed than asked, and suction
+ * pulls R toward 9 kOhm; err < 0 wants compression. */
+static action_t hold_next(const hold_cfg_t *cfg, const hold_state_t *st, int target,
+                          int ohms, long now)
+{
+    int err = ohms - target;
+    long ran = st->action == ACT_OFF ? 0 : now - st->action_started_ms;
+
+    if (st->action != ACT_OFF) {
+        if (ran < cfg->min_on_ms) {
+            return st->action;                      /* finish the bite */
+        }
+        if (ran >= cfg->max_on_ms || abs(err) <= cfg->deadband) {
+            return ACT_OFF;                         /* enough, or arrived */
+        }
+        if ((st->action == ACT_SUCTION) != (err > 0)) {
+            return ACT_OFF;                         /* shot past the target */
+        }
+        return st->action;
+    }
+    if (abs(err) <= cfg->deadband || now - st->last_change_ms < cfg->min_off_ms) {
+        return ACT_OFF;
+    }
+    return err > 0 ? ACT_SUCTION : ACT_COMPRESSION;
+}
+
+static void hold_apply(hold_state_t *st, action_t a, long now)
+{
+    if (a == st->action) {
+        return;
+    }
+    if (a != ACT_OFF) {
+        st->action_started_ms = now;
+    }
+    st->last_change_ms = now;
+    st->action = a;
+}
+
+static const hold_cfg_t hold_cfg = { HOLD_DEADBAND_OHMS, HOLD_MIN_ON_MS, HOLD_MIN_OFF_MS,
+                                     HOLD_MAX_ON_MS };
+static hold_state_t hold_st;
+static int hold_target;             /* 0 = not holding */
+static bool hold_stalled;           /* stopped itself: needs a new hold or status */
+static int hold_err;                /* last error while holding */
+static int hold_best_err;           /* smallest |error| seen since the target was set */
+static long hold_best_ms;           /* when it last improved */
+static SemaphoreHandle_t hold_lock; /* guards the pins, hold state and the ADC read */
+
+/* Index into STATES for an action (the table is off, suction, compression). */
+static int action_state(action_t a)
+{
+    return a == ACT_SUCTION ? 1 : a == ACT_COMPRESSION ? 2 : 0;
+}
+
+/* Stop holding and drop the pumps. Caller must not hold the lock.
+ * Does NOT touch the pins when no hold is running: a manual `set gpio 1 low`
+ * must keep the valve where it is, and a no-op cancel would clear it. */
+static void hold_cancel(void)
+{
+    if (!hold_lock) {
+        return;
+    }
+    xSemaphoreTake(hold_lock, portMAX_DELAY);
+    if (hold_target) {
+        hold_target = 0;
+        hold_err = 0;
+        write_pins(false, false, false);
+    }
+    hold_stalled = false;
+    hold_st.action = ACT_OFF;
+    xSemaphoreGive(hold_lock);
+}
+
+/* One tick of the loop. Keeps the lock while touching the pins or the ADC, so
+ * a command from the console can't interleave with a bite. */
+static void hold_step(void)
+{
+    xSemaphoreTake(hold_lock, portMAX_DELAY);
+    if (!hold_target) {
+        xSemaphoreGive(hold_lock);
+        return;                     /* manual mode: the console owns the pins */
+    }
+    long now = (long)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    int raw, mv;
+    sense_read(&raw, &mv);
+
+    if (mv < 0) {
+        ESP_LOGW(TAG, "hold off: sensor unreadable, pumps stopped");
+        hold_target = 0;
+        hold_stalled = true;
+    } else {
+        int ohms = ohms_from_mv(mv);
+        hold_err = ohms - hold_target;
+        if (abs(hold_err) < hold_best_err) {
+            hold_best_err = abs(hold_err);
+            hold_best_ms = now;
+        } else if (abs(hold_err) > hold_cfg.deadband && hold_st.action != ACT_OFF &&
+                   now - hold_best_ms > HOLD_STALL_MS) {
+            /* Pumping, still outside the band, and getting nowhere: blocked line,
+             * dead pump, kinked tube. Being *inside* the band is not a stall, it's
+             * the loop working - holding there means the error stops improving. */
+            ESP_LOGW(TAG, "hold stalled at %d ohms (target %d), pumps stopped",
+                     ohms, hold_target);
+            hold_target = 0;
+            hold_stalled = true;
+        }
+    }
+    if (hold_target) {
+        hold_apply(&hold_st, hold_next(&hold_cfg, &hold_st, hold_target,
+                                       ohms_from_mv(mv), now), now);
+        const pump_state_t *s = &STATES[action_state(hold_st.action)];
+        write_pins(s->valve, s->comp, s->suct);
+    } else {
+        hold_st.action = ACT_OFF;
+        write_pins(false, false, false);
+    }
+    xSemaphoreGive(hold_lock);
+}
+
+static void hold_task(void *arg)
+{
+    (void)arg;
+    TickType_t last = xTaskGetTickCount();
+    while (1) {
+        vTaskDelayUntil(&last, pdMS_TO_TICKS(HOLD_TICK_MS));
+        hold_step();
+    }
+}
+
 /* Index into STATES matching the pads, or -1 for a combination the named states
  * don't cover (reachable only by raw "set gpio 0 ..."). */
 static int current_state(void)
@@ -243,13 +412,25 @@ static int current_state(void)
 
 static void status(void)
 {
+    xSemaphoreTake(hold_lock, portMAX_DELAY);
     int i = current_state();
     int raw, mv;
     sense_read(&raw, &mv);
-    reply("OK %s gpio0=%d gpio1=%d gpio2=%d adc=%d mv=%d r=%d",
-          i < 0 ? "raw" : STATES[i].name,
-          gpio_get_level(PIN_VALVE), gpio_get_level(PIN_COMP), gpio_get_level(PIN_SUCT),
-          raw, mv, mv < 0 ? -1 : ohms_from_mv(mv));
+    char hold[12];
+    if (hold_target) {
+        snprintf(hold, sizeof hold, "%d", hold_target);
+    } else {
+        strcpy(hold, hold_stalled ? "stalled" : "off");
+    }
+    int err = hold_target ? hold_err : 0;
+    int ohms = mv < 0 ? -1 : ohms_from_mv(mv);
+    int valve = gpio_get_level(PIN_VALVE);
+    int comp = gpio_get_level(PIN_COMP);
+    int suct = gpio_get_level(PIN_SUCT);
+    xSemaphoreGive(hold_lock);
+
+    reply("OK %s gpio0=%d gpio1=%d gpio2=%d adc=%d mv=%d r=%d hold=%s err=%+d",
+          i < 0 ? "raw" : STATES[i].name, valve, comp, suct, raw, mv, ohms, hold, err);
 }
 
 static void go_to_state(int i)
@@ -316,6 +497,21 @@ static int parse_pin(const char *s)
     return -1;
 }
 
+/* "12000" or "12k" -> ohms, or -1 if it isn't a number. */
+static int parse_ohms(const char *s)
+{
+    char *end;
+    long v = strtol(s, &end, 10);
+    if (end == s) {
+        return -1;
+    }
+    if (*end == 'k' || *end == 'K') {
+        v *= 1000;
+        end++;
+    }
+    return *end ? -1 : (int)v;
+}
+
 static void handle(char *line)
 {
     for (char *p = line; *p; p++) {
@@ -333,17 +529,46 @@ static void handle(char *line)
 
     for (int i = 0; i < N_STATES; i++) {
         if (!strcmp(tok[0], STATES[i].name)) {
+            hold_cancel();                  /* a manual move takes the rig back */
             go_to_state(i);
             return;
         }
     }
 
     if (!strcmp(tok[0], "toggle")) {
+        /* Read the position BEFORE cancelling: hold_cancel() drops the pins, so
+         * reading after it would always report "off" and toggle would be stuck
+         * going to suction. */
         int i = current_state();
+        hold_cancel();
         go_to_state(i < 0 ? 0 : (i + 1) % N_STATES);   /* raw -> off */
         return;
     }
     if (!strcmp(tok[0], "status")) {
+        status();
+        return;
+    }
+    if (!strcmp(tok[0], "hold")) {
+        if (n == 2 && !strcmp(tok[1], "off")) {
+            hold_cancel();
+            status();
+            return;
+        }
+        int ohms = n == 2 ? parse_ohms(tok[1]) : -1;
+        if (ohms < HOLD_MIN_OHMS || ohms > HOLD_MAX_OHMS) {
+            reply("ERR hold needs a target in ohms (hold 12000 | hold 12k | hold off)");
+            return;
+        }
+        xSemaphoreTake(hold_lock, portMAX_DELAY);
+        hold_target = ohms;
+        hold_stalled = false;
+        hold_err = 0;
+        hold_best_err = INT_MAX;            /* so the stall guard starts fresh */
+        hold_best_ms = (long)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+        hold_st.action = ACT_OFF;
+        hold_st.last_change_ms = (long)(xTaskGetTickCount() * portTICK_PERIOD_MS) -
+                                 HOLD_MIN_OFF_MS;   /* the first bite needn't wait */
+        xSemaphoreGive(hold_lock);
         status();
         return;
     }
@@ -362,6 +587,7 @@ static void handle(char *line)
             reply("ERR level must be high or low");
             return;
         }
+        hold_cancel();                  /* raw pin access takes the rig back too */
         set_pin(pin, high);
         status();
         return;
@@ -410,6 +636,9 @@ void app_main(void)
     console_init();
     sense_init();
 
+    hold_lock = xSemaphoreCreateMutex();
+    ESP_ERROR_CHECK(hold_lock ? ESP_OK : ESP_ERR_NO_MEM);
+
     write_pins(false, false, false);    /* power-on state: off */
     selftest();
     write_pins(false, false, false);
@@ -418,8 +647,13 @@ void app_main(void)
     ESP_LOGI(TAG, "sensor: adc=%d mv=%d r=%d", s.raw, s.mv,
              s.mv < 0 ? -1 : ohms_from_mv(s.mv));
     ESP_LOGI(TAG, "ready — commands: off | suction | compression | toggle | "
-                  "set gpio 0|1|2 high|low | status");
+                  "set gpio 0|1|2 high|low | hold <ohms>|12k|off | status");
     status();
+
+    /* The hold loop runs here, not on the host: if the laptop sleeps or the USB
+     * re-enumerates, the glove must keep holding. 3 kB is enough for the ADC
+     * read plus the log line - raise it if something heavy ever goes in. */
+    xTaskCreate(hold_task, "hold", 3072, NULL, 5, NULL);
 
     char line[80];
     while (1) {

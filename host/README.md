@@ -13,6 +13,8 @@ Two clients for the ESP32-C3 firmware in this repo, both over its USB serial por
 ./glove_pump.py off
 ./glove_pump.py set 1 high          # raw pin access
 ./glove_pump.py set gpio 2 low      # same thing, either spelling
+./glove_pump.py hold 12k            # closed loop: hold the sensor at 12 kOhm
+./glove_pump.py hold off            # stop holding
 ./glove_pump.py status
 ./glove_pump.py                     # interactive: type commands, ^D to exit
 ./glove_pump.py --selftest          # run the script's own checks, no hardware
@@ -241,6 +243,13 @@ those are the "fully open" and "fully closed" resistances that the percentage is
 between, so measure your own ends and put them there. The sensor's own maths (mV → ohms) runs
 on the firmware; the app only formats it and flags the two degenerate cases: `r=-1` ("no
 reading — check the GPIO4 wiring") and anything above 100 kΩ ("open circuit").
+
+**Hold controls.** Type a target in kΩ and press **Hold**; **Release** sends `hold off`. The
+loop runs on the board (see the top-level README), so this window is only a monitor: closing
+it, or the laptop sleeping, does not stop the hold. The readout line shows
+`holding at 12.0 kΩ · error +230 Ω`, or `hold stalled — pumps stopped …` if the firmware gave
+up because pumping stopped making progress. Input is validated here before anything is sent
+(a number of kΩ between 1 and 100) — a typo cannot turn into a command.
 
 When the board goes away the same line turns red and the buttons grey out:
 

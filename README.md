@@ -26,9 +26,9 @@ then the pump starts).
 ## Commands
 
 Every line sent to the port gets exactly one line back:
-`OK <state> gpio0=<0|1> gpio1=<0|1> gpio2=<0|1> adc=<raw> mv=<mV> r=<ohms>` or
-`ERR <reason>`, where `<state>` is `off`, `suction`, `compression`, or `raw` for a hand-set
-pin combination. Case-insensitive.
+`OK <state> gpio0=<0|1> gpio1=<0|1> gpio2=<0|1> adc=<raw> mv=<mV> r=<ohms>
+hold=<target|off|stalled> err=<signed ohms>` or `ERR <reason>`, where `<state>` is `off`,
+`suction`, `compression`, or `raw` for a hand-set pin combination. Case-insensitive.
 
 | Command | Effect |
 |---|---|
@@ -39,11 +39,50 @@ pin combination. Case-insensitive.
 | `set gpio 0 high\|low` | raw valve control |
 | `set gpio 1 high\|low` | raw compression pump; raising it drops GPIO2 and moves the valve high |
 | `set gpio 2 high\|low` | raw suction pump; raising it drops GPIO1 and moves the valve low |
-| `status` | report state and pin levels, change nothing |
+| `hold <ohms>`, `hold 12k` | closed loop: pulse the pumps to keep the sensor at that target |
+| `hold off` | stop holding (any manual command does this too) |
+| `status` | report state, pins, sensor and hold, change nothing |
 
 The named states are the intended interface (the UI uses only those). `set gpio …` is raw
 bench access: raising a pump still enforces both hardware rules, lowering one leaves the
 valve where it is — which is how you reach a `raw` valve-only combination.
+
+## Hold
+
+`hold 12k` keeps the sensor near 12000 Ω by pulsing the pumps. `hold off` — or any manual
+command — stops it.
+
+The pumps are on/off, so this is a deadband plus dwell times, not PID. `HOLD_DEADBAND_OHMS` is
+1000 (the ±1 kΩ asked for), and the loop only ever runs the pump that pushes R toward the
+target: when a bite overshoots, the leak brings R back by itself, so the valve never flips
+per cycle. Deadband and dwell are all `#define`s at the top of `main/glove_pump.c`:
+
+| Knob | Default | What it's for |
+|---|---|---|
+| `HOLD_DEADBAND_OHMS` | 1000 | the band around the target |
+| `HOLD_MIN_ON_MS` | 100 | one bite must move **less than the band** and **more than the pump's spin-up** — the knob to turn first |
+| `HOLD_MIN_OFF_MS` | 200 | rest between bites: no chatter, no valve flap |
+| `HOLD_MAX_ON_MS` | 400 | longest single bite, caps the overshoot |
+| `HOLD_TICK_MS` | 50 | how often it reads and decides |
+
+`err = R − target`, so a positive error means too closed and the loop runs suction. A bite
+runs to `MIN_ON` even if the band is reached sooner, so **the smallest step it can take is
+`MIN_ON` × the pump's flow rate**. If that step is bigger than the band, the hold can't be
+tight: lower `MIN_ON` (down to the pump's spin-up), or widen the band. On the simulated plant
+in the tests a 400 Ω bite against a 40 Ω/tick leak settles in the band with the pumps on
+about 13 % of ticks — a fast pump means shorter bites.
+
+It runs on the board, in its own task, not on the host: the laptop can sleep, the USB can
+re-enumerate, and the glove keeps holding. Safety, because a stuck loop with a live pump is
+the failure that matters:
+
+- the sensor is unreadable (`r=-1`) → hold stops, pumps off, and it says so rather than
+  pumping blind;
+- pumping while still outside the band and making no progress for `HOLD_STALL_MS` (15 s) →
+  `hold=stalled`, pumps off (blocked line, dead pump, kinked tube). Being *inside* the band
+  is not a stall — that's the loop working;
+- targets are limited to 1 kΩ–100 kΩ: above that, the tap sits within a few mV of the rail
+  and the divider can't measure anything.
 
 ## Wiring
 
@@ -212,7 +251,13 @@ python3 host/glove_pump.py --selftest
 python3 test/test_app_link.py        # the desktop app's reconnect logic, no display needed
 ```
 
-The C test links the real `main/glove_pump.c` against stubbed GPIO and checks the two
+The C test links the real `main/glove_pump.c` against stubbed GPIO, ADC and FreeRTOS, so it
+exercises the production code, not a copy of it. Besides the parser, the pump/valve rules and
+the sensor maths it drives `hold_next()` through its whole decision table (band, dwell,
+`max_on`, crossing the target) and then runs `hold_step()` against a **simulated glove** for
+20 s — a plant that responds to the pumps at 400 Ω/tick and leaks 40 Ω/tick — asserting the
+loop settles inside the band, that the pumps are never both high during it, and that a dead
+pump or an unreadable sensor ends with the pins low and `hold=stalled`. It also checks the two
 hardware rules after **every** command path (all three named states, all three `toggle`
 steps, raising each pump, lowering each pump, uppercase, bad pin, bad level, unknown
 command, blank line): the pumps are never both high, and the valve is never left on the

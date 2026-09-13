@@ -10,6 +10,9 @@ typedef int gpio_num_t;
 typedef int esp_err_t;
 
 #define ESP_OK 0
+#define ESP_FAIL -1
+#define ESP_ERR_NO_MEM 0x101
+#define ESP_ERR_INVALID_ARG 0x102
 #define GPIO_NUM_0 0
 #define GPIO_NUM_1 1
 #define GPIO_NUM_2 2
@@ -43,6 +46,28 @@ int gpio_get_level(gpio_num_t pin);
 typedef int TickType_t;
 #define pdMS_TO_TICKS(ms) (ms)
 void vTaskDelay(TickType_t ticks);
+
+/* --- fake FreeRTOS bits, for the hold task ---------------------------- */
+/* One tick is one millisecond in the stub, so a test can drive time. The mutex
+ * is a no-op: the harness is single-threaded, but the real firmware must not be
+ * tempted to skip it (hold_step/status share the pins and the ADC). */
+#define portTICK_PERIOD_MS 1
+#define portMAX_DELAY 0xFFFFFFFFu
+#define pdTRUE 1
+#define pdPASS 1
+typedef void *SemaphoreHandle_t;
+typedef int BaseType_t;
+typedef int UBaseType_t;
+typedef void *TaskHandle_t;
+typedef void (*TaskFunction_t)(void *);
+
+SemaphoreHandle_t xSemaphoreCreateMutex(void);
+BaseType_t xSemaphoreTake(SemaphoreHandle_t mutex, TickType_t wait);
+BaseType_t xSemaphoreGive(SemaphoreHandle_t mutex);
+TickType_t xTaskGetTickCount(void);
+void vTaskDelayUntil(TickType_t *prev, TickType_t period);
+BaseType_t xTaskCreate(TaskFunction_t fn, const char *name, uint32_t stack,
+                       void *arg, UBaseType_t prio, TaskHandle_t *out);
 
 typedef enum { ESP_LINE_ENDINGS_CRLF, ESP_LINE_ENDINGS_CR, ESP_LINE_ENDINGS_LF } esp_line_endings_t;
 void usb_serial_jtag_vfs_set_rx_line_endings(esp_line_endings_t mode);
