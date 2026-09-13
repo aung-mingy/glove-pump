@@ -147,8 +147,8 @@ static void reply_grab(void)
 #define SENSOR " adc=1350 mv=1350 r=9000"
 #define HOLD   " hold=off err=+0"
 
-/* The two hardware rules, checked after every command: the pumps are never both
- * high, and the valve is never left on the other pump's path. */
+/* The one hardware rule, checked after every command: the pumps are never both
+ * high. The valve is free — `set gpio 0 …` moves it on its own. */
 #define EXPECT(cmd, want) do {                                          \
         SEND(cmd);                                                      \
         if (strcmp(out, want)) {                                        \
@@ -156,7 +156,6 @@ static void reply_grab(void)
         }                                                               \
         assert(!strcmp(out, want));                                     \
         assert(!(level[PIN_COMP] && level[PIN_SUCT]));                  \
-        assert(!(level[PIN_COMP] && !level[PIN_VALVE]));                \
     } while (0)
 
 int main(void)
@@ -214,19 +213,38 @@ int main(void)
     EXPECT("toggle\n", "OK compression gpio0=1 gpio1=1 gpio2=0" SENSOR HOLD);
     EXPECT("toggle\n", "OK off gpio0=0 gpio1=0 gpio2=0" SENSOR HOLD);
 
-    /* raw pin commands: raising a pump pairs the valve and drops the other pump */
-    EXPECT("set gpio 1 high\n", "OK compression gpio0=1 gpio1=1 gpio2=0" SENSOR HOLD);
+    /* raw pin commands: raising a pump drops the other one and nothing else —
+     * the valve is not touched, so these read back as "raw" combinations */
+    EXPECT("set gpio 1 high\n", "OK raw gpio0=0 gpio1=1 gpio2=0" SENSOR HOLD);
     EXPECT("set gpio 2 high\n", "OK suction gpio0=0 gpio1=0 gpio2=1" SENSOR HOLD);
     EXPECT("set gpio 2 low\n", "OK off gpio0=0 gpio1=0 gpio2=0" SENSOR HOLD);
 
-    /* lowering is local: the valve keeps its position, so a valve-only
-     * combination reads back as "raw" */
+    /* the valve moves only when it is set, and stays put through pump changes:
+     * that is the handle for checking which pump a valve level actually routes */
+    EXPECT("set gpio 0 high\n", "OK raw gpio0=1 gpio1=0 gpio2=0" SENSOR HOLD);
+    EXPECT("set gpio 2 high\n", "OK raw gpio0=1 gpio1=0 gpio2=1" SENSOR HOLD);
     EXPECT("set gpio 1 high\n", "OK compression gpio0=1 gpio1=1 gpio2=0" SENSOR HOLD);
     EXPECT("set gpio 1 low\n", "OK raw gpio0=1 gpio1=0 gpio2=0" SENSOR HOLD);
     EXPECT("set gpio 0 low\n", "OK off gpio0=0 gpio1=0 gpio2=0" SENSOR HOLD);
     EXPECT("set gpio 0 high\n", "OK raw gpio0=1 gpio1=0 gpio2=0" SENSOR HOLD);
 
+    /* valve low with compression running is now reachable too */
+    EXPECT("set gpio 0 low\n", "OK off gpio0=0 gpio1=0 gpio2=0" SENSOR HOLD);
+    EXPECT("set gpio 1 high\n", "OK raw gpio0=0 gpio1=1 gpio2=0" SENSOR HOLD);
+    EXPECT("set gpio 0 high\n", "OK compression gpio0=1 gpio1=1 gpio2=0" SENSOR HOLD);
+    EXPECT("off\n", "OK off gpio0=0 gpio1=0 gpio2=0" SENSOR HOLD);
+
+    /* both pumps can never be high: each raise drops the other, and the valve
+     * is left exactly where it was set */
+    EXPECT("set gpio 0 high\n", "OK raw gpio0=1 gpio1=0 gpio2=0" SENSOR HOLD);
+    EXPECT("set gpio 1 high\n", "OK compression gpio0=1 gpio1=1 gpio2=0" SENSOR HOLD);
+    EXPECT("set gpio 2 high\n", "OK raw gpio0=1 gpio1=0 gpio2=1" SENSOR HOLD);
+    EXPECT("set gpio 1 high\n", "OK compression gpio0=1 gpio1=1 gpio2=0" SENSOR HOLD);
+    EXPECT("set gpio 0 low\n", "OK raw gpio0=0 gpio1=1 gpio2=0" SENSOR HOLD);
+    EXPECT("off\n", "OK off gpio0=0 gpio1=0 gpio2=0" SENSOR HOLD);
+
     /* toggle out of a raw combination goes to off */
+    EXPECT("set gpio 0 high\n", "OK raw gpio0=1 gpio1=0 gpio2=0" SENSOR HOLD);
     EXPECT("toggle\n", "OK off gpio0=0 gpio1=0 gpio2=0" SENSOR HOLD);
 
     EXPECT("set gpio 3 high\n", "ERR pin must be 0, 1 or 2");

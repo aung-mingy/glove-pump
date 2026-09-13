@@ -37,8 +37,8 @@ hold=<target|off|stalled> err=<signed ohms>` or `ERR <reason>`, where `<state>` 
 | `compression` | GPIO0 and GPIO1 high |
 | `toggle` | next state: off → suction → compression → off |
 | `set gpio 0 high\|low` | raw valve control |
-| `set gpio 1 high\|low` | raw compression pump; raising it drops GPIO2 and moves the valve high |
-| `set gpio 2 high\|low` | raw suction pump; raising it drops GPIO1 and moves the valve low |
+| `set gpio 1 high\|low` | raw compression pump; raising it drops GPIO2, nothing else |
+| `set gpio 2 high\|low` | raw suction pump; raising it drops GPIO1, nothing else |
 | `hold <ohms>`, `hold 12k` | closed loop: pulse the pumps to keep the sensor at that target |
 | `hold off` | stop holding (any manual command does this too) |
 | `status` | report state, pins, sensor and hold, change nothing |
@@ -47,7 +47,11 @@ The named states are the intended interface; the app's three big buttons use onl
 **Manual:** boxes are the raw route — one checkbox per line (valve, compression, suction), each
 sending `set gpio 0|1|2 high|low`. The boxes display what the board reports, not what you
 clicked, so the safety rules stay in one place: raising a pump on the board drops the other one
-and pairs the valve, and the box for the pump that got dropped clears itself on the reply.
+and the valve is **not** touched, so the box for the pump that got dropped clears itself on the
+reply. `set gpio 0 high|low` moves the valve on its own, with no pump running — that is the
+handle for checking which pump a given valve level actually routes, since that mapping is an
+assumption about the rig and not something the firmware can know. Nothing is enforced in the
+app: the rule lives on the board, for every client.
 Lowering a pin is local — which is how you reach a valve-only `raw` combination.
 
 ## Hold
@@ -76,8 +80,10 @@ in the tests a 400 Ω bite against a 40 Ω/tick leak settles in the band with th
 about 13 % of ticks — a fast pump means shorter bites.
 
 It runs on the board, in its own task, not on the host: the laptop can sleep, the USB can
-re-enumerate, and the glove keeps holding. Safety, because a stuck loop with a live pump is
-the failure that matters:
+re-enumerate, and the glove keeps holding. The loop sets all three pins itself — a state means
+a valve position *plus* a pump, and the hold needs a known pumping direction, so it overrides
+whatever the valve was left on. Safety, because a stuck loop with a live pump is the failure
+that matters:
 
 - the sensor is unreadable (`r=-1`) → hold stops, pumps off, and it says so rather than
   pumping blind;

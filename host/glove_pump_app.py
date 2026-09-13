@@ -231,7 +231,8 @@ class App:
 
         # Manual per-pin control. These mirror what the board reports, not what was
         # clicked, and the firmware enforces the one real rule: raising a pump drops
-        # the other one and pairs the valve. No copy of that rule lives here.
+        # the other one. No version of that rule lives here, and the valve is never
+        # touched by a pump command - these boxes are independent.
         self.pin_vars = {}
         self.manual_widgets = []
         manual = ttk.Frame(frame)
@@ -285,8 +286,8 @@ class App:
 
     def manual(self, pin):
         """A manual pin toggle: send what the box now says. The board enforces the
-        rule (raising a pump drops the other and pairs the valve), and its reply
-        re-syncs the boxes, so they show the rig and not the click."""
+        rule (raising a pump drops the other pump, and the valve is untouched), and
+        its reply re-syncs the boxes, so they show the rig and not the click."""
         self.tick(manual_command(pin, bool(self.pin_vars[pin].get())))
 
     def hold(self):

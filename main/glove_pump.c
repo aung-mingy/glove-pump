@@ -7,7 +7,9 @@
  *   GPIO1  compression pump
  *   GPIO2  suction pump
  *
- * Three states. The valve always follows the running pump, so these are the
+ * Three states, each a valve position plus a pump. Whether a given valve level
+ * routes suction or compression is an assumption about the rig - `set gpio 0
+ * high|low` moves the valve on its own, with no pump, so it can be checked.
  * only pump-running combinations that exist:
  *
  *   off          valve 0  comp 0  suct 0
@@ -34,8 +36,8 @@
  *   off | suction | compression   go to that state
  *   toggle                        off -> suction -> compression -> off
  *   set gpio 0|1|2 high|low       raw pin access; the two pumps can never be
- *                                 high together, and raising a pump sets the
- *                                 valve to match it
+ *                                 high together, and the valve moves only when
+ *                                 you set it (0 = valve on its own)
  *   hold <ohms> | hold 12k        closed loop: pulse the pumps to keep the
  *   hold off                      sensor near a target the host sets. Any
  *                                 manual command takes the rig back
@@ -442,13 +444,16 @@ static void go_to_state(int i)
     status();
 }
 
-/* Raw pin access, for bench testing. Raising a pump enforces both hardware
- * rules; lowering one is local (the valve keeps its position). */
+/* Raw pin access. Raising a pump drops the other one — that is the only rule the
+ * hardware needs. The valve is NOT driven from here: which pump a given valve
+ * level routes is an assumption about the rig, and this is the handle for
+ * checking it. The named states still set all three pins (a state means a valve
+ * position plus a pump); the hold loop sets all three too, because it needs a
+ * known pumping direction. */
 static void set_pin(int pin, bool high)
 {
     if (high && (pin == PIN_COMP || pin == PIN_SUCT)) {
         gpio_set_level(pin == PIN_COMP ? PIN_SUCT : PIN_COMP, 0);
-        gpio_set_level(PIN_VALVE, pin == PIN_COMP);   /* valve follows the pump */
     }
     gpio_set_level(pin, high);
 }
