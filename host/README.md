@@ -195,7 +195,7 @@ A silent device costs one `--timeout` and returns `""`.
 | `/dev/null is not a serial port: (25, 'Inappropriate ioctl for device')` | `--port` points at something that isn't a tty |
 | `no reply from device (wrong port, or firmware not running)` | wrong port (see the UART caveat below), firmware not flashed, or the board is held in reset. Raise `--timeout` if the device is slow, lower it if you want fast failures |
 | Reply arrives but the pump doesn't move | pins are driven — check the wiring against the GPIO table in the top-level README |
-| `r=9000`…`r=20000` never changes | sensor not on GPIO4 (an ADC1 pin), or the wire isn't making contact — see the bring-up checks in the top-level README |
+| `r=9000`…`r=20000` never changes | sensor not on GPIO3 (an ADC1 pin), or the wire isn't making contact — see the bring-up checks in the top-level README |
 | `mv` / `r` move when you press Suction or Compression | the sensor is sharing a pin with a pump output (on the C3 the SPI MISO default is GPIO2, our suction line). Move the wire |
 | Works after a manual reset, not after flashing | the port was reopened by the flasher mid-run; just re-run the command |
 | `device disconnected: [Errno 5] Input/output error` | the board vanished mid-command (cable, power, hub). Re-run; the desktop app flags and recovers from this on its own |
@@ -233,7 +233,7 @@ follows.
 │ │  Off   │ │ Suction │ │     Compression     │ │  <- current state filled green,
 │ └────────┘ └─────────┘ └─────────────────────┘ │     others still clickable
 │ valve 1 · compression 1 · suction 0            │
-│ glove 13.1 kΩ · 37% closed (1655 mV)           │  <- from the GPIO4 divider
+│ glove 13.1 kΩ · 37% closed (1655 mV)           │  <- from the GPIO3 divider
 │ connected · /dev/ttyACM0      [Search for device] │
 └────────────────────────────────────────────────┘
 ```
@@ -242,7 +242,7 @@ follows.
 those are the "fully open" and "fully closed" resistances that the percentage is scaled
 between, so measure your own ends and put them there. The sensor's own maths (mV → ohms) runs
 on the firmware; the app only formats it and flags the two degenerate cases: `r=-1` ("no
-reading — check the GPIO4 wiring") and anything above 100 kΩ ("open circuit").
+reading — check the GPIO3 wiring") and anything above 100 kΩ ("open circuit").
 
 **Hold controls.** Type a target in kΩ and press **Hold**; **Release** sends `hold off`. The
 loop runs on the board (see the top-level README), so this window is only a monitor: closing

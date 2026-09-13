@@ -91,7 +91,7 @@ the failure that matters:
 | Valve | GPIO0 | plain IO (analog alt: XTAL_32K_P / ADC1_CH0) |
 | Compression pump | GPIO1 | plain IO (analog alt: XTAL_32K_N / ADC1_CH1) |
 | Suction pump | GPIO2 | plain IO (analog alt: ADC1_CH2) |
-| Glove sensor | GPIO4 | must be an **ADC1** pin (GPIO0–GPIO4); the C3's ADC2 is unusable |
+| Glove sensor | GPIO3 | must be an **ADC1** pin (GPIO0–GPIO4); the C3's ADC2 is unusable |
 | USB D− / D+ | GPIO18 / GPIO19 | fixed; the console and flashing ride on these |
 
 Plug the host into the USB port wired to **GPIO18/19**. On an ESP32-C3-DevKitM-1/DevKitC-1
@@ -112,7 +112,7 @@ Two chip notes:
 A variable resistor across a fixed 13 kΩ, tapped by the ADC:
 
 ```
-3V3 ──[13 kΩ]──┬── GPIO4 (ADC1_CH4)
+3V3 ──[13 kΩ]──┬── GPIO3 (ADC1_CH3)
                │
              [R_var]        R_var ≈ 9 kΩ  glove fully open  → ~1350 mV
                │            R_var ≈ 20 kΩ glove fully closed → ~2000 mV
@@ -143,11 +143,12 @@ labels are the board vendor's, not the driver's. Nothing about that pin is a wir
 and there is no workaround: ADC2 is unusable on this chip.
 
 GPIO0/1/2 are the valve and pumps, so the free ADC1 pins are GPIO3 (`A3`) and GPIO4 (`A4`).
-This rig uses **GPIO4 (`A4`)**. It is `MTMS`, so a JTAG probe would fight it — but the console
-and flashing here ride on USB-Serial-JTAG (GPIO18/19), so nothing does. GPIO3 is the drop-in
-alternative: move the wire, then change `PIN_SENSE` and `SENSE_CHANNEL` **together** (the build
-asserts the pair matches; changing one silently reads a floating pad and looks exactly like bad
-wiring). Both of the mistakes that cost a debugging session are build errors: an unsupported ADC
+This rig uses **GPIO3 (`A3`)**. GPIO4 was tried first and read ~600 mV on a node a multimeter
+measured at 1.5 V — GPIO4 is `MTMS`, so its JTAG pad configuration is the one thing about it
+that isn't ordinary electrical behaviour, and A3 has no such role. To switch back: move the wire,
+then change `PIN_SENSE` and `SENSE_CHANNEL` **together** (the build asserts the pair matches;
+changing one silently reads a floating pad and looks exactly like bad wiring). Both of the
+mistakes that cost a debugging session are build errors: an unsupported ADC
 unit trips an `#error`, and putting the sensor on a pump pin trips a `_Static_assert`. Putting it
 on GPIO0-2 would be worse than useless anyway — the pad is driven there, and
 `adc_oneshot_config_channel()` would disable that output and leave the pump line floating.

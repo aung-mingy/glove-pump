@@ -138,7 +138,7 @@ check("above the closed end clamps to 100%",
       app.sensor_text({"r": "44000", "mv": "2540"}),
       "glove 44.0 kΩ · 100% closed (2540 mV)")
 check("unreadable sensor", app.sensor_text({"r": "-1", "mv": "-1"}),
-      "glove — no reading (check the GPIO4 wiring)")
+      "glove — no reading (check the GPIO3 wiring)")
 check("open circuit", app.sensor_text({"r": "999999", "mv": "3300"}),
       "glove — open circuit (sensor disconnected?)")
 check("no sensor fields in the reply", app.sensor_text({"gpio0": "0"}), "")
