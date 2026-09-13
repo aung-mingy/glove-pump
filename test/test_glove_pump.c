@@ -80,6 +80,10 @@ esp_err_t adc_cali_raw_to_voltage(adc_cali_handle_t h, int raw, int *out_mv)
     *out_mv = raw;
     return ESP_OK;
 }
+const char *esp_err_to_name(esp_err_t code)
+{
+    return code == ESP_OK ? "ESP_OK" : "stub error";
+}
 
 #include "../main/glove_pump.c"
 

@@ -72,7 +72,7 @@ def sensor_text(pins):
     except ValueError:
         return "sensor ?"
     if ohms < 0:
-        return "glove — no reading (check the GPIO5 wiring)"
+        return "glove — no reading (check the GPIO3 wiring)"
     if ohms > SENSOR_MAX_OHMS:
         return "glove — open circuit (sensor disconnected?)"
     closed = max(0.0, min(100.0, (ohms - GLOVE_OPEN_OHMS) * 100.0 /

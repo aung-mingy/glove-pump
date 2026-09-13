@@ -13,6 +13,7 @@ typedef int esp_err_t;
 #define GPIO_NUM_0 0
 #define GPIO_NUM_1 1
 #define GPIO_NUM_2 2
+#define GPIO_NUM_3 3
 #define GPIO_MODE_DEF_INPUT 1
 #define GPIO_MODE_OUTPUT 2
 #define GPIO_MODE_INPUT_OUTPUT 3
@@ -45,12 +46,19 @@ void vTaskDelay(TickType_t ticks);
 typedef enum { ESP_LINE_ENDINGS_CRLF, ESP_LINE_ENDINGS_CR, ESP_LINE_ENDINGS_LF } esp_line_endings_t;
 void usb_serial_jtag_vfs_set_rx_line_endings(esp_line_endings_t mode);
 
-/* --- esp_adc (GPIO5 glove sensor) ------------------------------------- */
-#define ADC_UNIT_2 2
+/* --- esp_adc (sensor front end) --------------------------------------- */
+/* Mirrors IDF: adc_unit_t and adc_channel_t are 0-based enums (ADC_UNIT_1 == 0),
+ * and soc_caps gates which units the driver will accept at all. The C3's real
+ * caps are reproduced here: unit 0 only, 5 channels on unit 0 and 1 on unit 1 —
+ * that's what makes an ADC2 pin a *driver* error on a C3, not a wiring problem. */
+#define ADC_UNIT_1 0
+#define ADC_UNIT_2 1
 #define ADC_CHANNEL_0 0
+#define ADC_CHANNEL_3 3
 #define ADC_ATTEN_DB_12 3
 #define ADC_BITWIDTH_DEFAULT 12
 #define ADC_ULP_MODE_DISABLE 0
+#define SOC_ADC_DIG_SUPPORTED_UNIT(unit) ((unit) == 0)
 #define ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED 1
 
 typedef int adc_unit_t;
@@ -77,6 +85,9 @@ esp_err_t adc_oneshot_read(adc_oneshot_unit_handle_t unit, adc_channel_t chan, i
 esp_err_t adc_cali_create_scheme_curve_fitting(const adc_cali_curve_fitting_config_t *cfg,
                                                adc_cali_handle_t *out_handle);
 esp_err_t adc_cali_raw_to_voltage(adc_cali_handle_t handle, int raw, int *out_mv);
+
+/* Real IDF has this; the firmware logs it so a failed ADC init names its cause. */
+const char *esp_err_to_name(esp_err_t code);
 
 typedef struct {
     uint32_t tx_buffer_size;

@@ -15,11 +15,16 @@
  *   compression  valve 1  comp 1  suct 0
  *
  * Input:
- *   GPIO5  glove sensor, ADC2 channel 0 (also MTDI — see README before wiring
- *          a JTAG probe). Voltage divider: 3.3 V --[13 kOhm]-- tap --[R]-- GND,
- *          so  mv = 3300 * R / (13000 + R)  and  R = 13000 * mv / (3300 - mv).
+ *   GPIO3  glove sensor, ADC1 channel 3. Voltage divider:
+ *          3.3 V --[13 kOhm]-- tap --[R_var]-- GND, so
+ *          mv = 3300 * R / (13000 + R)  and  R = 13000 * mv / (3300 - mv).
  *          ~9 kOhm with the glove fully open (~1350 mV), ~20 kOhm fully closed
  *          (~2000 mV).
+ *          Must be an ADC1 pin (GPIO0-GPIO4). The ESP32-C3's ADC2 is not
+ *          supported by the ADC driver at all — SOC_ADC_DIG_SUPPORTED_UNIT() is
+ *          true for unit 0 only, "ADC2 oneshot mode is no longer supported, due
+ *          to hardware limitation" — so the A5/GPIO5 pin on a Super Mini cannot
+ *          be read, however it is wired.
  *
  * Commands (case-insensitive):
  *   off | suction | compression   go to that state
@@ -52,21 +57,33 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "soc/soc_caps.h"
 
 #define PIN_VALVE GPIO_NUM_0
 #define PIN_COMP  GPIO_NUM_1
 #define PIN_SUCT  GPIO_NUM_2
-#define PIN_SENSE GPIO_NUM_5
+#define PIN_SENSE GPIO_NUM_3
 
-/* Sensor front end. GPIO5 is ADC2 channel 0 on the ESP32-C3 — ADC1 only goes up
- * to GPIO4, so this is the pin to use for it. */
-#define SENSE_UNIT        ADC_UNIT_2
-#define SENSE_CHANNEL     ADC_CHANNEL_0
+/* Sensor front end. ADC1 only: the C3's ADC2 is not supported by the ADC driver
+ * (see the file header), so GPIO5/A5 is unusable even though the board labels it
+ * "A5". GPIO0-GPIO4 are the ADC1 pins, and three of them are the pump outputs. */
+#define SENSE_UNIT        ADC_UNIT_1
+#define SENSE_CHANNEL     ADC_CHANNEL_3
 #define SENSE_ATTEN       ADC_ATTEN_DB_12      /* the tap sits at 1.35-2.0 V */
 #define SENSE_SERIES_OHMS 13000                /* the fixed resistor */
 #define SENSE_VCC_MV      3300                 /* the 3.3 V rail, as wired */
 #define SENSE_SAMPLES     8                    /* average: the ADC is noisy */
 #define SENSE_OPEN_OHMS   999999               /* cap for "no sensor"/open */
+
+/* Make the two wiring mistakes that cost an evening into build errors: an ADC
+ * unit the driver doesn't support (silently reports r=-1 on the real chip), and
+ * a sensor pin shared with a pump output (the pad would be driven, and
+ * adc_oneshot_config_channel() would release it and leave it floating). */
+#if !SOC_ADC_DIG_SUPPORTED_UNIT(SENSE_UNIT)
+#error "SENSE_UNIT is not supported by the ADC driver on this target"
+#endif
+_Static_assert(PIN_SENSE != PIN_VALVE && PIN_SENSE != PIN_COMP && PIN_SENSE != PIN_SUCT,
+               "the sensor and a pump cannot share a pin");
 
 static const char *TAG = "glove-pump";
 
@@ -107,7 +124,7 @@ static void write_pins(bool valve, bool comp, bool suct)
     gpio_set_level(PIN_SUCT, suct);
 }
 
-/* --- glove sensor: 3.3 V --[13 kOhm]-- tap --[R_var]-- GND, tap on GPIO5 --- */
+/* --- glove sensor: 3.3 V --[13 kOhm]-- tap --[R_var]-- GND, tap on GPIO3 --- */
 
 static adc_oneshot_unit_handle_t sense_adc;
 static adc_cali_handle_t sense_cali;
@@ -116,22 +133,26 @@ static bool sense_calibrated;
 
 static void sense_init(void)
 {
-    /* ADC2 (GPIO5). It is shared with the Wi-Fi radio, so reads fail with
-     * ESP_ERR_TIMEOUT if this firmware ever starts a radio. */
     adc_oneshot_unit_init_cfg_t unit = {
         .unit_id = SENSE_UNIT,
         .ulp_mode = ADC_ULP_MODE_DISABLE,
     };
-    if (adc_oneshot_new_unit(&unit, &sense_adc) != ESP_OK) {
-        ESP_LOGW(TAG, "sensor: no ADC unit — reporting r=-1");
+    esp_err_t err = adc_oneshot_new_unit(&unit, &sense_adc);
+    if (err != ESP_OK) {
+        /* Name the error: "adc unit not supported" here means the pin is on an
+         * ADC unit this chip's driver refuses (on the C3, that's ADC2 = GPIO5). */
+        ESP_LOGW(TAG, "sensor: adc unit %d unavailable (%s) — reporting r=-1",
+                 SENSE_UNIT + 1, esp_err_to_name(err));
         return;
     }
     adc_oneshot_chan_cfg_t chan = {
         .atten = SENSE_ATTEN,
         .bitwidth = ADC_BITWIDTH_DEFAULT,
     };
-    if (adc_oneshot_config_channel(sense_adc, SENSE_CHANNEL, &chan) != ESP_OK) {
-        ESP_LOGW(TAG, "sensor: channel config failed — reporting r=-1");
+    err = adc_oneshot_config_channel(sense_adc, SENSE_CHANNEL, &chan);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "sensor: channel %d config failed (%s) — reporting r=-1",
+                 SENSE_CHANNEL, esp_err_to_name(err));
         return;
     }
 #if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED

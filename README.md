@@ -52,7 +52,7 @@ valve where it is — which is how you reach a `raw` valve-only combination.
 | Valve | GPIO0 | plain IO (analog alt: XTAL_32K_P / ADC1_CH0) |
 | Compression pump | GPIO1 | plain IO (analog alt: XTAL_32K_N / ADC1_CH1) |
 | Suction pump | GPIO2 | plain IO (analog alt: ADC1_CH2) |
-| Glove sensor | GPIO5 | **ADC2 channel 0** — ADC1 only reaches GPIO4, so this is the pin |
+| Glove sensor | GPIO3 | must be an **ADC1** pin (GPIO0–GPIO4); the C3's ADC2 is unusable |
 | USB D− / D+ | GPIO18 / GPIO19 | fixed; the console and flashing ride on these |
 
 Plug the host into the USB port wired to **GPIO18/19**. On an ESP32-C3-DevKitM-1/DevKitC-1
@@ -73,7 +73,7 @@ Two chip notes:
 A variable resistor across a fixed 13 kΩ, tapped by the ADC:
 
 ```
-3V3 ──[13 kΩ]──┬── GPIO5 (ADC2_CH0)
+3V3 ──[13 kΩ]──┬── GPIO3 (ADC1_CH3)
                │
              [R_var]        R_var ≈ 9 kΩ  glove fully open  → ~1350 mV
                │            R_var ≈ 20 kΩ glove fully closed → ~2000 mV
@@ -89,15 +89,26 @@ knows about your rig, they live in `host/glove_pump_app.py` as `GLOVE_OPEN_OHMS`
 `GLOVE_CLOSED_OHMS` — measure your own ends and set them there. `r` saturates at 999999 Ω
 (open circuit / no sensor) and is −1 if the ADC read itself failed.
 
-**Identify the pin on your board before trusting the reading.** On an ESP32-C3 Super Mini the
-silkscreen for this pin reads `IO5 / A5 · MISO`, which is three labels for one pin:
+**The sensor has to land on an ADC1 pin: GPIO0–GPIO4.** On the ESP32-C3 the ADC driver
+supports unit 1 only. The C3's own `soc_caps.h` says so —
+`SOC_ADC_DIG_SUPPORTED_UNIT(UNIT)` is `((UNIT == 0) ? 1 : 0)` — and IDF's ADC example skips
+ADC2 for this target with *"On ESP32C3, ADC2 is no longer supported, due to its HW
+limitation."* The datasheet agrees: ADC2 is not factory-calibrated, and the errata list
+"ADC2 of some chip revisions is not operable".
 
-- `IO5` and `A5` are the real ones: GPIO5, and ADC2 channel 0 on this chip (ADC1 stops at
-  GPIO4). That is what the firmware uses.
-- `MISO` is the vendor's SPI annotation. SPI signals are routable to any pin through the GPIO
-  matrix, but the chip's *default* (IOMUX) MISO is **GPIO2** — which is the suction pump here.
-  If you ever move this wire to a pin your board ties to MISO by default, you and the pump
-  will fight over it: the readout would then follow the pump state instead of the glove.
+So **GPIO5 — the pin an ESP32-C3 Super Mini labels `IO5 / A5 · MISO` — cannot be read at
+all**, however correctly it is wired. `adc_oneshot_new_unit()` fails with
+`ESP_ERR_INVALID_ARG: adc unit not supported`, and the firmware reports
+`adc=-1 mv=-1 r=-1` with a `sensor: adc unit 2 unavailable` warning in the boot log. The `A`
+labels are the board vendor's, not the driver's. Nothing about that pin is a wiring fault,
+and there is no workaround: ADC2 is unusable on this chip.
+
+GPIO0/1/2 are the valve and pumps, so the sensor's home here is **GPIO3 (`A3`)**. GPIO4
+(`A4`) would also work but is `MTMS`, so a JTAG probe would fight it. Both of the mistakes
+that cost a debugging session are now build errors: an unsupported unit trips an `#error`, and
+putting the sensor on a pump pin trips a `_Static_assert`. Putting it on GPIO0-2 would be
+worse than useless anyway — the pad is driven there, and `adc_oneshot_config_channel()` would
+disable that output and leave the pump line floating.
 
 Bring-up check, in order:
 1. `glove_pump.py status` with the glove open, then closed — `mv` should land near 1350 → 2000
@@ -105,12 +116,14 @@ Bring-up check, in order:
    within ~50 mV.
 2. Press Suction and Compression. `r` and `mv` must **not move**. If they do, the sensor is
    sharing a pin with a pump output — move the wire.
-3. If `mv` sits at 0 or 3300 and freezes, nothing is connected to GPIO5: check the wire, the
-   3V3 end, and the ground.
+3. `adc=-1 mv=-1 r=-1` in the reply (with the `adc unit … unavailable` warning at boot) means
+   the sensor pin is not on a readable ADC unit — check it against the GPIO table above, not
+   the silkscreen. `mv` frozen at 0 or 3300 means the divider isn't connected: check the 3V3
+   end and the ground.
 
 Notes:
-- GPIO5 is **ADC2**, which the Wi-Fi radio shares. Reads return `r=-1` if this firmware ever
-  starts a radio. It doesn't.
+- ADC1 is not shared with the radio, so the reading stays valid with Wi-Fi on (this build
+  never starts a radio anyway).
 - The reading is an average of 8 samples, and the ADC uses the chip's eFuse curve-fitting
   calibration (the scheme differs per chip — that's why the include is `adc_cali_scheme.h`
   plus a `#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED`). Without burnt eFuse values it falls
